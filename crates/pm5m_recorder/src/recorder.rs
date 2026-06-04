@@ -59,7 +59,12 @@ pub fn run_once(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result<Re
     let cycle_start = now_unix_ns() as i64;
     state.last_cycle_start_ts_ns = Some(cycle_start);
 
-    let assets = if should_discover(config, &state) {
+    let prune_failed_from_state;
+    let assets = if !config.source.discovery.enabled {
+        prune_failed_from_state = false;
+        config.source.explicit_assets.clone()
+    } else if should_discover(config, &state) {
+        prune_failed_from_state = true;
         match discover_assets(config, fetcher) {
             Ok(assets) => {
                 let merged = merge_assets(config.source.explicit_assets.clone(), assets);
@@ -74,6 +79,7 @@ pub fn run_once(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result<Re
             Err(err) => return Err(err).context("discover assets"),
         }
     } else {
+        prune_failed_from_state = true;
         state.last_assets.clone()
     };
 
@@ -84,6 +90,7 @@ pub fn run_once(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result<Re
 
     let mut rows = Vec::new();
     let mut errors = Vec::new();
+    let mut failed_asset_ids = BTreeSet::new();
     for asset in &assets {
         match fetch_book(config, fetcher, asset, config.top_n, state.next_ingest_seq) {
             Ok(row) => {
@@ -92,9 +99,15 @@ pub fn run_once(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result<Re
             }
             Err(err) => {
                 state.total_errors += 1;
+                failed_asset_ids.insert(asset.asset_id.clone());
                 errors.push(format!("{} {}: {err}", asset.symbol, asset.asset_id));
             }
         }
+    }
+    if prune_failed_from_state && !failed_asset_ids.is_empty() {
+        state
+            .last_assets
+            .retain(|asset| !failed_asset_ids.contains(&asset.asset_id));
     }
 
     let output_path = if rows.is_empty() {

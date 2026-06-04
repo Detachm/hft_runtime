@@ -141,13 +141,59 @@ fn recorder_output_does_not_contain_strategy_fields() {
         r#"{"bids":[{"price":"0.4","size":"1"}],"asks":[{"price":"0.6","size":"1"}]}"#,
     );
 
-    run_once(&config, &fetcher).unwrap();
+    let report = run_once(&config, &fetcher).unwrap();
+    assert_eq!(report.rows_written, 1);
     let violations = scan_json_fields(
         &config.raw_root,
         &["model_probability", "edge", "trigger", "pnl"],
     )
     .unwrap();
     assert_eq!(violations, Vec::new());
+}
+
+#[test]
+fn failed_discovered_assets_are_pruned_until_next_discovery() {
+    let temp = TempDir::new().unwrap();
+    let mut config =
+        RecorderConfig::default_for_roots(temp.path().join("raw"), temp.path().join("state"));
+    config.source.gamma_markets_url = "https://gamma.example/markets".to_string();
+    config.source.clob_base_url = "https://clob.example".to_string();
+    config.source.discovery.pm5m_symbols = vec!["BTC".to_string()];
+    config.discovery_interval_cycles = 60;
+
+    let current_s = (market_data_etl_core::now_unix_ns() / 1_000_000_000) as i64;
+    let epoch = (current_s / 300) * 300;
+    let market_end_ms = (epoch + 300) * 1000;
+
+    let mut fetcher = FakeFetcher::default();
+    fetcher.insert(
+        "https://gamma.example/events?active=true&closed=false&series_slug=btc-up-or-down-5m&limit=8&order=end_date&ascending=true",
+        &format!(
+            r#"{{
+                "events": [{{
+                    "slug": "btc-updown-5m-{epoch}",
+                    "markets": [{{
+                        "conditionId": "cond-btc",
+                        "market_end_ms": {market_end_ms},
+                        "outcomes": "[\"Up\", \"Down\"]",
+                        "clobTokenIds": "[\"asset-up\", \"asset-down\"]"
+                    }}]
+                }}]
+            }}"#
+        ),
+    );
+    fetcher.insert(
+        "https://clob.example/book?token_id=asset-up",
+        r#"{"bids":[{"price":"0.49","size":"1"}],"asks":[{"price":"0.51","size":"1"}]}"#,
+    );
+
+    let first = run_once(&config, &fetcher).unwrap();
+    assert_eq!(first.rows_written, 1);
+    assert_eq!(first.errors.len(), 1);
+
+    let second = run_once(&config, &fetcher).unwrap();
+    assert_eq!(second.rows_written, 1);
+    assert_eq!(second.errors.len(), 0);
 }
 
 #[derive(Default)]
