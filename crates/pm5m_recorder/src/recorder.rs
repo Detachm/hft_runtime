@@ -363,6 +363,21 @@ fn parse_pm5m_gamma_payload(payload: &Value, symbol: Option<&str>) -> Vec<Pm5mMa
 }
 
 fn parse_pm5m_market(record: &Value, symbol: Option<&str>) -> Result<Pm5mMarket> {
+    if bool_field(record, &["closed"]).unwrap_or(false) {
+        return Err(anyhow!("closed PM5M market"));
+    }
+    if bool_field(record, &["active"]).is_some_and(|active| !active) {
+        return Err(anyhow!("inactive PM5M market"));
+    }
+    if bool_field(record, &["acceptingOrders", "accepting_orders"])
+        .is_some_and(|accepting| !accepting)
+    {
+        return Err(anyhow!("PM5M market not accepting orders"));
+    }
+    if bool_field(record, &["enableOrderBook", "enable_order_book"]).is_some_and(|enabled| !enabled)
+    {
+        return Err(anyhow!("PM5M market has no order book"));
+    }
     let condition_id = string_field(record, &["condition_id", "conditionId"])
         .ok_or_else(|| anyhow!("missing condition id"))?;
     let outcomes = required_string_array(record.get("outcomes")).context("parse outcomes")?;
