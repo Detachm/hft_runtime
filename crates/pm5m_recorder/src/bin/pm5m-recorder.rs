@@ -28,6 +28,10 @@ enum Command {
         poll_interval_ms: u64,
         #[arg(long, default_value_t = 24)]
         max_assets_per_cycle: usize,
+        #[arg(long, default_value_t = 200)]
+        discovery_limit: usize,
+        #[arg(long, default_value_t = 60)]
+        discovery_interval_cycles: u64,
         #[arg(long = "filter")]
         question_or_slug_contains_any: Vec<String>,
     },
@@ -54,11 +58,15 @@ fn main() -> Result<()> {
             state_root,
             poll_interval_ms,
             max_assets_per_cycle,
+            discovery_limit,
+            discovery_interval_cycles,
             question_or_slug_contains_any,
         } => {
             let mut config = RecorderConfig::default_for_roots(raw_root, state_root);
             config.poll_interval_ms = poll_interval_ms;
             config.max_assets_per_cycle = max_assets_per_cycle;
+            config.discovery_interval_cycles = discovery_interval_cycles;
+            config.source.discovery.limit = discovery_limit;
             config.source.discovery.question_or_slug_contains_any = question_or_slug_contains_any;
             write_json_file_pretty(&path, &config)?;
             println!("{}", path.display());
