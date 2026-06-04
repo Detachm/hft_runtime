@@ -725,6 +725,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm5m_recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "market_data_etl_core",
+ "pm5m_data_etl",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "pm5m_research_engine"
 version = "0.1.0"
 dependencies = [
