@@ -32,6 +32,8 @@ enum Command {
         discovery_limit: usize,
         #[arg(long, default_value_t = 60)]
         discovery_interval_cycles: u64,
+        #[arg(long = "symbol")]
+        pm5m_symbols: Vec<String>,
         #[arg(long = "filter")]
         question_or_slug_contains_any: Vec<String>,
     },
@@ -60,6 +62,7 @@ fn main() -> Result<()> {
             max_assets_per_cycle,
             discovery_limit,
             discovery_interval_cycles,
+            pm5m_symbols,
             question_or_slug_contains_any,
         } => {
             let mut config = RecorderConfig::default_for_roots(raw_root, state_root);
@@ -67,6 +70,9 @@ fn main() -> Result<()> {
             config.max_assets_per_cycle = max_assets_per_cycle;
             config.discovery_interval_cycles = discovery_interval_cycles;
             config.source.discovery.limit = discovery_limit;
+            if !pm5m_symbols.is_empty() {
+                config.source.discovery.pm5m_symbols = pm5m_symbols;
+            }
             config.source.discovery.question_or_slug_contains_any = question_or_slug_contains_any;
             write_json_file_pretty(&path, &config)?;
             println!("{}", path.display());

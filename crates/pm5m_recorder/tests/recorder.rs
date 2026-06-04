@@ -12,6 +12,7 @@ fn run_once_discovers_gamma_assets_and_writes_raw_book_rows() {
         RecorderConfig::default_for_roots(temp.path().join("raw"), temp.path().join("state"));
     config.source.gamma_markets_url = "https://gamma.example/markets".to_string();
     config.source.clob_base_url = "https://clob.example".to_string();
+    config.source.discovery.pm5m_symbols = Vec::new();
     config.max_assets_per_cycle = 2;
     config.top_n = 2;
 
@@ -64,6 +65,60 @@ fn run_once_discovers_gamma_assets_and_writes_raw_book_rows() {
 
     assert!(config.state_root.join("recorder_state.json").exists());
     assert!(config.state_root.join("recorder_manifest.json").exists());
+}
+
+#[test]
+fn run_once_discovers_pm5m_series_markets_like_legacy_probe() {
+    let temp = TempDir::new().unwrap();
+    let mut config =
+        RecorderConfig::default_for_roots(temp.path().join("raw"), temp.path().join("state"));
+    config.source.gamma_markets_url = "https://gamma.example/markets".to_string();
+    config.source.clob_base_url = "https://clob.example".to_string();
+    config.source.discovery.pm5m_symbols = vec!["BTC".to_string()];
+    config.max_assets_per_cycle = 2;
+
+    let current_s = (market_data_etl_core::now_unix_ns() / 1_000_000_000) as i64;
+    let epoch = (current_s / 300) * 300;
+    let market_end_ms = (epoch + 300) * 1000;
+
+    let mut fetcher = FakeFetcher::default();
+    fetcher.insert(
+        "https://gamma.example/events?active=true&closed=false&series_slug=btc-up-or-down-5m&limit=8&order=end_date&ascending=true",
+        &format!(
+            r#"{{
+                "events": [{{
+                    "slug": "btc-updown-5m-{epoch}",
+                    "title": "BTC Up or Down",
+                    "markets": [{{
+                        "conditionId": "cond-btc",
+                        "market_end_ms": {market_end_ms},
+                        "outcomes": "[\"Up\", \"Down\"]",
+                        "clobTokenIds": "[\"asset-up\", \"asset-down\"]",
+                        "question": "BTC up or down?"
+                    }}]
+                }}]
+            }}"#
+        ),
+    );
+    fetcher.insert(
+        "https://clob.example/book?token_id=asset-up",
+        r#"{"bids":[{"price":"0.49","size":"1"}],"asks":[{"price":"0.51","size":"1"}]}"#,
+    );
+    fetcher.insert(
+        "https://clob.example/book?token_id=asset-down",
+        r#"{"bids":[{"price":"0.48","size":"1"}],"asks":[{"price":"0.52","size":"1"}]}"#,
+    );
+
+    let report = run_once(&config, &fetcher).unwrap();
+    assert_eq!(report.rows_written, 2);
+
+    let rows = read_jsonl_file::<RawPolymarketBookTop10>(&report.output_path.unwrap()).unwrap();
+    assert_eq!(rows[0].symbol, "BTC");
+    assert_eq!(rows[0].condition_id, "cond-btc");
+    assert_eq!(rows[0].asset_id, "asset-up");
+    assert_eq!(rows[0].outcome, "YES");
+    assert_eq!(rows[1].asset_id, "asset-down");
+    assert_eq!(rows[1].outcome, "NO");
 }
 
 #[test]

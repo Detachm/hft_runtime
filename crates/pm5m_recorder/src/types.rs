@@ -55,27 +55,67 @@ impl Default for PolymarketRecorderSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GammaDiscoveryConfig {
+    #[serde(default = "default_pm5m_symbols")]
+    pub pm5m_symbols: Vec<String>,
+    #[serde(default = "default_pm5m_past_window_count")]
+    pub pm5m_past_window_count: i64,
+    #[serde(default = "default_pm5m_future_window_count")]
+    pub pm5m_future_window_count: i64,
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_discovery_limit")]
     pub limit: usize,
+    #[serde(default = "default_discovery_order")]
     pub order: String,
+    #[serde(default)]
     pub ascending: bool,
+    #[serde(default = "default_true")]
     pub require_accepting_orders: bool,
+    #[serde(default = "default_true")]
     pub require_order_book: bool,
+    #[serde(default)]
     pub question_or_slug_contains_any: Vec<String>,
 }
 
 impl Default for GammaDiscoveryConfig {
     fn default() -> Self {
         Self {
+            pm5m_symbols: default_pm5m_symbols(),
+            pm5m_past_window_count: default_pm5m_past_window_count(),
+            pm5m_future_window_count: default_pm5m_future_window_count(),
             enabled: true,
-            limit: 24,
-            order: "volume24hr".to_string(),
+            limit: default_discovery_limit(),
+            order: default_discovery_order(),
             ascending: false,
             require_accepting_orders: true,
             require_order_book: true,
             question_or_slug_contains_any: Vec::new(),
         }
     }
+}
+
+fn default_pm5m_symbols() -> Vec<String> {
+    vec!["BTC".to_string(), "ETH".to_string(), "SOL".to_string()]
+}
+
+fn default_pm5m_past_window_count() -> i64 {
+    1
+}
+
+fn default_pm5m_future_window_count() -> i64 {
+    5
+}
+
+fn default_discovery_limit() -> usize {
+    24
+}
+
+fn default_discovery_order() -> String {
+    "volume24hr".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

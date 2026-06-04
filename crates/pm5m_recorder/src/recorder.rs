@@ -1,9 +1,10 @@
 use crate::types::*;
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use market_data_etl_core::{hash_path, now_unix_ns, sha256_bytes, write_json_file_pretty};
 use pm5m_data_etl::{BookLevel, RawPolymarketBookTop10};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -129,6 +130,9 @@ fn discover_assets(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result
     if !config.source.discovery.enabled {
         return Ok(config.source.explicit_assets.clone());
     }
+    if !config.source.discovery.pm5m_symbols.is_empty() {
+        return discover_pm5m_assets(config, fetcher);
+    }
 
     let discovery = &config.source.discovery;
     let mut url = format!(
@@ -174,6 +178,80 @@ fn discover_assets(config: &RecorderConfig, fetcher: &dyn HttpFetcher) -> Result
     }
 
     Ok(merge_assets(config.source.explicit_assets.clone(), assets))
+}
+
+fn discover_pm5m_assets(
+    config: &RecorderConfig,
+    fetcher: &dyn HttpFetcher,
+) -> Result<Vec<AssetSpec>> {
+    let discovery = &config.source.discovery;
+    let base = gamma_base_url(&config.source.gamma_markets_url);
+    let current_s = (now_unix_ns() / 1_000_000_000) as i64;
+    let epoch = (current_s / 300) * 300;
+    let mut urls = Vec::new();
+
+    for raw_symbol in &discovery.pm5m_symbols {
+        let symbol = raw_symbol.to_ascii_uppercase();
+        if let Some(series_slug) = pm5m_series_slug(&symbol) {
+            urls.push((
+                symbol.clone(),
+                format!(
+                    "{base}/events?active=true&closed=false&series_slug={}&limit=8&order=end_date&ascending=true",
+                    percent_encode(series_slug)
+                ),
+            ));
+        }
+        if let Some(prefix) = pm5m_slug_prefix(&symbol) {
+            for offset in -discovery.pm5m_past_window_count..discovery.pm5m_future_window_count {
+                urls.push((
+                    symbol.clone(),
+                    format!(
+                        "{base}/events/slug/{prefix}-updown-5m-{}",
+                        epoch + offset * 300
+                    ),
+                ));
+            }
+        }
+    }
+
+    let mut markets = BTreeMap::new();
+    for (symbol, url) in urls {
+        let Ok(bytes) = fetcher.get(&url) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        for market in parse_pm5m_gamma_payload(&payload, Some(&symbol)) {
+            let lower_ms = current_s * 1000 - 300_000;
+            let upper_ms = current_s * 1000 + 2_400_000;
+            if market.window_end_ms >= lower_ms && market.window_start_ms <= upper_ms {
+                markets.insert(market.condition_id.clone(), market);
+            }
+        }
+    }
+
+    let mut assets = Vec::new();
+    for market in markets.into_values() {
+        assets.push(AssetSpec {
+            symbol: market.symbol.clone(),
+            condition_id: market.condition_id.clone(),
+            asset_id: market.yes_asset_id,
+            outcome: "YES".to_string(),
+        });
+        assets.push(AssetSpec {
+            symbol: market.symbol,
+            condition_id: market.condition_id,
+            asset_id: market.no_asset_id,
+            outcome: "NO".to_string(),
+        });
+    }
+
+    let merged = merge_assets(config.source.explicit_assets.clone(), assets);
+    if merged.is_empty() {
+        return Err(anyhow!("no PM5M markets discovered"));
+    }
+    Ok(merged)
 }
 
 fn market_matches(market: &Value, discovery: &GammaDiscoveryConfig) -> bool {
@@ -248,6 +326,144 @@ fn fetch_book(
         bids,
         asks,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Pm5mMarket {
+    symbol: String,
+    condition_id: String,
+    window_start_ms: i64,
+    window_end_ms: i64,
+    yes_asset_id: String,
+    no_asset_id: String,
+}
+
+fn parse_pm5m_gamma_payload(payload: &Value, symbol: Option<&str>) -> Vec<Pm5mMarket> {
+    let mut markets = Vec::new();
+    for event in gamma_events(payload) {
+        for record in gamma_markets_from_event(event) {
+            let mut merged = record.clone();
+            if let Some(slug) = event.get("slug").cloned() {
+                merged["event_slug"] = slug;
+            }
+            if let Some(title) = event.get("title").cloned() {
+                merged["event_title"] = title;
+            }
+            if let Ok(market) = parse_pm5m_market(&merged, symbol) {
+                markets.push(market);
+            }
+        }
+    }
+    if markets.is_empty() && payload.is_object() {
+        if let Ok(market) = parse_pm5m_market(payload, symbol) {
+            markets.push(market);
+        }
+    }
+    markets
+}
+
+fn parse_pm5m_market(record: &Value, symbol: Option<&str>) -> Result<Pm5mMarket> {
+    let condition_id = string_field(record, &["condition_id", "conditionId"])
+        .ok_or_else(|| anyhow!("missing condition id"))?;
+    let outcomes = required_string_array(record.get("outcomes")).context("parse outcomes")?;
+    let token_ids = required_string_array(
+        record
+            .get("clobTokenIds")
+            .or_else(|| record.get("clob_token_ids")),
+    )
+    .context("parse clob token ids")?;
+    if outcomes.len() != token_ids.len() {
+        return Err(anyhow!("outcomes and token ids length mismatch"));
+    }
+    let mut assets = BTreeMap::new();
+    for (outcome, token_id) in outcomes.into_iter().zip(token_ids) {
+        assets.insert(normalize_pm5m_outcome(&outcome), token_id);
+    }
+    let yes_asset_id = assets
+        .remove("YES")
+        .ok_or_else(|| anyhow!("missing YES asset"))?;
+    let no_asset_id = assets
+        .remove("NO")
+        .ok_or_else(|| anyhow!("missing NO asset"))?;
+    let window_end_ms = timestamp_ms(
+        record,
+        &["market_end_ms", "endDate", "endDateIso", "end_date", "end"],
+    )?;
+    let window_start_ms = pm5m_window_start_ms(record, window_end_ms);
+    if window_end_ms - window_start_ms != 300_000 {
+        return Err(anyhow!("not a 5m market"));
+    }
+    let symbol = symbol
+        .map(ToString::to_string)
+        .or_else(|| infer_pm5m_symbol(record))
+        .ok_or_else(|| anyhow!("missing PM5M symbol"))?;
+
+    Ok(Pm5mMarket {
+        symbol,
+        condition_id,
+        window_start_ms,
+        window_end_ms,
+        yes_asset_id,
+        no_asset_id,
+    })
+}
+
+fn gamma_events(payload: &Value) -> Vec<&Value> {
+    if let Some(items) = payload.as_array() {
+        return items.iter().filter(|item| item.is_object()).collect();
+    }
+    if let Some(items) = payload
+        .get("events")
+        .or_else(|| payload.get("data"))
+        .and_then(Value::as_array)
+    {
+        return items.iter().filter(|item| item.is_object()).collect();
+    }
+    if payload.get("markets").is_some() {
+        return vec![payload];
+    }
+    Vec::new()
+}
+
+fn gamma_markets_from_event(event: &Value) -> Vec<&Value> {
+    if let Some(items) = event.get("markets").and_then(Value::as_array) {
+        return items.iter().filter(|item| item.is_object()).collect();
+    }
+    if event.get("conditionId").is_some()
+        && event.get("outcomes").is_some()
+        && event.get("clobTokenIds").is_some()
+    {
+        return vec![event];
+    }
+    Vec::new()
+}
+
+fn required_string_array(value: Option<&Value>) -> Result<Vec<String>> {
+    let Some(value) = value else {
+        return Err(anyhow!("missing array"));
+    };
+    let parsed;
+    let items = if let Some(text) = value.as_str() {
+        parsed = serde_json::from_str::<Value>(text).context("parse JSON string array")?;
+        parsed
+            .as_array()
+            .ok_or_else(|| anyhow!("string field is not an array"))?
+    } else {
+        value
+            .as_array()
+            .ok_or_else(|| anyhow!("field is not an array"))?
+    };
+    if items.is_empty() {
+        return Err(anyhow!("array must not be empty"));
+    }
+    Ok(items
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| item.to_string())
+        })
+        .collect())
 }
 
 fn parse_levels(value: Option<&Value>) -> Result<Vec<BookLevel>> {
@@ -383,6 +599,126 @@ fn number_field(value: &Value, names: &[&str]) -> Option<f64> {
             _ => None,
         })
     })
+}
+
+fn timestamp_ms(record: &Value, names: &[&str]) -> Result<i64> {
+    for name in names {
+        let Some(value) = record.get(*name) else {
+            continue;
+        };
+        if let Some(raw) = value.as_i64() {
+            return Ok(if raw < 10_000_000_000_000 {
+                raw
+            } else {
+                raw / 1_000_000
+            });
+        }
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            if let Ok(raw) = text.parse::<i64>() {
+                return Ok(if raw < 10_000_000_000_000 {
+                    raw
+                } else {
+                    raw / 1_000_000
+                });
+            }
+            let normalized = if let Some(stripped) = text.strip_suffix('Z') {
+                format!("{stripped}+00:00")
+            } else {
+                text.to_string()
+            };
+            let dt = DateTime::parse_from_rfc3339(&normalized)
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|_| {
+                    NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S").map(|dt| dt.and_utc())
+                })
+                .with_context(|| format!("parse timestamp {text}"))?;
+            return Ok(dt.timestamp_millis());
+        }
+    }
+    Err(anyhow!("missing timestamp"))
+}
+
+fn pm5m_window_start_ms(record: &Value, end_ms: i64) -> i64 {
+    if let Some(slug) = string_field(record, &["slug", "event_slug", "ticker"]) {
+        if let Some((_, suffix)) = slug.rsplit_once("-5m-") {
+            if suffix.len() == 10 && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+                if let Ok(epoch) = suffix.parse::<i64>() {
+                    return epoch * 1000;
+                }
+            }
+        }
+    }
+    end_ms - 300_000
+}
+
+fn normalize_pm5m_outcome(outcome: &str) -> String {
+    match outcome.trim().to_ascii_uppercase().as_str() {
+        "UP" => "YES".to_string(),
+        "DOWN" => "NO".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn infer_pm5m_symbol(record: &Value) -> Option<String> {
+    let text = [
+        string_field(record, &["question"]),
+        string_field(record, &["title"]),
+        string_field(record, &["event_title"]),
+        string_field(record, &["slug"]),
+        string_field(record, &["event_slug"]),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+    if contains_wordish(&text, &["bitcoin", "btc"]) {
+        return Some("BTC".to_string());
+    }
+    if contains_wordish(&text, &["ethereum", "ether", "eth"]) {
+        return Some("ETH".to_string());
+    }
+    if contains_wordish(&text, &["solana", "sol"]) {
+        return Some("SOL".to_string());
+    }
+    None
+}
+
+fn contains_wordish(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        text.split(|ch: char| !ch.is_ascii_alphanumeric())
+            .any(|word| word == *needle)
+    })
+}
+
+fn pm5m_series_slug(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "BTC" => Some("btc-up-or-down-5m"),
+        "ETH" => Some("eth-up-or-down-5m"),
+        "SOL" => Some("sol-up-or-down-5m"),
+        _ => None,
+    }
+}
+
+fn pm5m_slug_prefix(symbol: &str) -> Option<&'static str> {
+    match symbol {
+        "BTC" => Some("btc"),
+        "ETH" => Some("eth"),
+        "SOL" => Some("sol"),
+        _ => None,
+    }
+}
+
+fn gamma_base_url(gamma_markets_url: &str) -> String {
+    let trimmed = gamma_markets_url.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/markets")
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
