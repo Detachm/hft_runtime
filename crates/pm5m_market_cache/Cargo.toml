@@ -1,0 +1,19 @@
+[package]
+name = "pm5m_market_cache"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crc32fast.workspace = true
+market_data_etl_core = { path = "../market_data_etl_core", version = "0.1.0" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

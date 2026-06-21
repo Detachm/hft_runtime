@@ -9,11 +9,14 @@ repository.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-market_data_etl_core = { path = "../market_data_etl_core" }
-pm5m_data_etl = { path = "../pm5m_data_etl" }
+futures-util.workspace = true
+market_data_etl_core = { path = "../market_data_etl_core", version = "0.1.0" }
+pm5m_market_cache = { path = "../pm5m_market_cache", version = "0.1.0" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

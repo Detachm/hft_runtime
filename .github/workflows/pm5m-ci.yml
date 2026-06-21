@@ -1,0 +1,17 @@
+name: pm5m-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pm5m:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Static perf gate
+        run: scripts/private/perf_gate_pm5m.sh --static-only
+      - name: Workspace tests
+        run: cargo test --workspace

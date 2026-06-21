@@ -1,62 +1,135 @@
-# Jupiter PM5M Data Pipeline
+# PM5M Runtime
 
-Standalone Rust workspace for the Jupiter-side PM5M data factory.
+This repository is the lean PM5M data and backtest stack for Polymarket up/down markets.
 
-Jupiter responsibilities:
+Start here:
 
-- discover/record markets and raw book data
-- sync external caches
-- materialize fact tables
-- derive `depth_feature`
-- build a standard replay event index
-- run quality acceptance
-- export accepted datasets
+- [docs/START_HERE_PM5M.md](docs/START_HERE_PM5M.md)
+- [docs/MODULE_OWNERSHIP.md](docs/MODULE_OWNERSHIP.md)
+- [docs/DATA_ROOTS.md](docs/DATA_ROOTS.md)
+- [docs/pm5m_new_chain_retirement_and_acceptance.md](docs/pm5m_new_chain_retirement_and_acceptance.md)
+- [docs/pm5m_backtest_results_0609_now.md](docs/pm5m_backtest_results_0609_now.md)
+- [docs/poly_live_multi_strategy_architecture.md](docs/poly_live_multi_strategy_architecture.md)
 
-Local-only research responsibilities live in `pm5m_research_engine` and include fair value, edge,
-trigger logic, replay policies, parameter search, and PnL.
+## Current Production Chain
 
-The Jupiter CLI is `pm5m-data-etl`:
+There is one active PM5M chain:
 
-```sh
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- plan --help
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- sync-inputs --plan ./plan/pipeline_plan.json
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- build-facts --plan ./plan/pipeline_plan.json
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- build-depth-feature --plan ./plan/pipeline_plan.json
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- build-event-index --plan ./plan/pipeline_plan.json
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- accept --plan ./plan/pipeline_plan.json
-cargo run -p pm5m_data_etl --bin pm5m-data-etl -- export --plan ./plan/pipeline_plan.json --export-root ./export
+```text
+Polymarket CLOB websocket
+Binance 1s reference websocket
+  -> HFTREC4 raw WS audit
+  -> HFTBOOK2 strategy-neutral book_state cache
+  -> HFTIDX1 file-backed book_state index
+  -> HFTREF1 reference cache
+  -> HFTSETTLE1 official settlement cache
+  -> pm5m-backtest run-fast
 ```
 
-The continuous Jupiter recorder CLI is `pm5m-recorder`:
+The raw WS audit is the source of truth. Repeated research and backtests should read
+HFTBOOK2/HFTIDX1 and compact reference/settlement caches, not replay raw WS payloads.
+
+Retired PM5M paths must not be reintroduced:
+
+- HFTREC3 raw segments
+- HFTBOOK1 book cache
+- JSONL raw import/replay
+- old `pm5m_research_engine`
+- raw-window backtest scripts
+- `pm5m-recorder run --config`
+
+## Crates
+
+Workspace crates:
+
+- `market_data_etl_core`: shared IO, hashing, Parquet/ZSTD, HFTREC4, atomic writes.
+- `pm5m_recorder`: live Polymarket discovery, CLOB WS recording, and Binance reference WS audit profile recording.
+- `pm5m_market_cache`: HFTBOOK2/HFTIDX1/HFTREF1/HFTSETTLE1 builders, validators, benches.
+- `pm5m_data_etl`: Jupiter typed Parquet ETL/export contract. Not the fast backtest hot path.
+
+Private crate:
+
+- `hft_private`: local-only strategy and backtest code. It is intentionally ignored by git and
+  outside the root workspace.
+
+## Common Commands
+
+Run the dual recorder. This records Polymarket CLOB into HFTREC4/HFTBOOK2 and Binance 1s
+reference metadata/audit profile for later live-vs-local alignment:
 
 ```sh
-cargo run -p pm5m_recorder --bin pm5m-recorder -- init-config \
-  --path ./runtime/pm5m-recorder.json \
-  --raw-root ./runtime/raw \
-  --state-root ./runtime/state \
-  --poll-interval-ms 1000 \
-  --max-assets-per-cycle 24 \
-  --symbol BTC \
-  --symbol ETH \
-  --symbol SOL
-
-cargo run -p pm5m_recorder --bin pm5m-recorder -- run --config ./runtime/pm5m-recorder.json
+ROOT_DIR=/home/hliu/hft_runtime \
+CONFIG=/home/hliu/hft_runtime/configs/pm5m-recorder-hftrec4.example.json \
+RAW_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/raw \
+STATE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/state \
+BOOK_STATE_CACHE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/book_hftbook2 \
+scripts/run_pm5m_recorder_supervised.sh
 ```
 
-For user-mode supervision on Jupiter:
+Build and validate the fast cache/index:
 
 ```sh
-tmux new-session -d -s hft-runtime-recorder \
-  'ROOT_DIR=/home/hliu/hft_runtime /home/hliu/hft_runtime/scripts/run_pm5m_recorder_supervised.sh'
+cargo run --release -p pm5m_market_cache --bin pm5m-market-cache -- build-book-cache \
+  --raw-root "${PM5M_RAW_ROOT}" \
+  --cache-root "${PM5M_BOOK_CACHE_ROOT}" \
+  --overwrite
+
+cargo run --release -p pm5m_market_cache --bin pm5m-market-cache -- validate-book-cache \
+  --cache-root "${PM5M_BOOK_CACHE_ROOT}"
+
+cargo run --release -p pm5m_market_cache --bin pm5m-market-cache -- build-book-index \
+  --book-cache-root "${PM5M_BOOK_CACHE_ROOT}" \
+  --index-root "${PM5M_BOOK_INDEX_ROOT}" \
+  --overwrite
+
+cargo run --release -p pm5m_market_cache --bin pm5m-market-cache -- validate-book-index \
+  --index-root "${PM5M_BOOK_INDEX_ROOT}"
 ```
 
-The recorder discovers PM5M Polymarket markets using the legacy series/slug rules:
-`btc-up-or-down-5m`, `eth-up-or-down-5m`, and `sol-up-or-down-5m`, plus nearby
-`*-updown-5m-{epoch}` slugs. It validates that discovered markets are 5-minute YES/NO
-CLOB markets, polls `clob.polymarket.com/book`, and appends ETL-compatible raw rows to
-recursive `polymarket_book_top10.jsonl` partitions. It writes `recorder_state.json` and
-`recorder_manifest.json` under the configured state root.
+Run the fast backtest with the current ETH gray live-aligned config, when the local private strategy
+checkout exists:
 
-Current table parts are deterministic JSONL. The shared `market_data_etl_core` crate isolates table
-writing, hashing, manifest, and schema guard behavior so the physical writer can be swapped for
-Parquet without changing the Jupiter/local ownership boundary.
+```sh
+cargo run --release --manifest-path hft_private/Cargo.toml --bin pm5m_backtest -- run-fast \
+  --book-cache-root "${PM5M_BOOK_CACHE_ROOT}" \
+  --book-index-root "${PM5M_BOOK_INDEX_ROOT}" \
+  --reference-cache-root "${PM5M_REFERENCE_CACHE_ROOT}" \
+  --settlement-cache-root "${PM5M_SETTLEMENT_CACHE_ROOT}" \
+  --config hft_private/configs/position_v4_edge_live_eth_gray_20260620.json \
+  --output-dir "${PM5M_OUTPUT_ROOT}/run"
+```
+
+Static safety gate:
+
+```sh
+scripts/private/perf_gate_pm5m.sh --static-only
+```
+
+Full perf gate with real paths:
+
+```sh
+export PM5M_RAW_ROOT=/path/to/hftrec4/raw
+export PM5M_BOOK_CACHE_ROOT=/path/to/hftbook2
+export PM5M_BOOK_INDEX_ROOT=/path/to/hftidx1
+export PM5M_REFERENCE_CACHE_ROOT=/path/to/hftref1
+export PM5M_SETTLEMENT_CACHE_ROOT=/path/to/hftsettle1
+export PM5M_CONFIG=/home/hliu/hft_runtime/hft_private/configs/position_v4_edge_live_eth_gray_20260620.json
+export PM5M_OUTPUT_ROOT=/path/to/reports
+scripts/private/perf_gate_pm5m.sh --required
+```
+
+## Verification
+
+Before handing off changes:
+
+```sh
+cargo fmt --check
+cargo test --workspace --no-fail-fast
+scripts/private/perf_gate_pm5m.sh --static-only
+```
+
+Local private strategy checks are optional and require an ignored `hft_private/` checkout:
+
+```sh
+cargo test --manifest-path hft_private/Cargo.toml --all-targets --no-fail-fast
+```
