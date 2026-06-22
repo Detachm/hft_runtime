@@ -48,7 +48,7 @@ fn full_chain_materializes_accepts_and_is_deterministic() {
     assert_eq!(events[1].event_type, "binance_reference_1s");
     assert_eq!(events[0].event_ts_ns, events[1].event_ts_ns);
     assert_eq!(events[0].payload_table, "tables/polymarket_book_top10");
-    assert_eq!(events[1].payload_table, "tables/okx_kline_1s_reference");
+    assert_eq!(events[1].payload_table, "tables/binance_kline_1s_reference");
     assert!(events
         .iter()
         .all(|event| !event.event_type.contains("settlement")));
@@ -82,7 +82,7 @@ fn build_depth_feature_reads_only_book_fact_table() {
     sync_inputs(&plan, &DefaultFetcher).unwrap();
     build_facts(&plan).unwrap();
 
-    fs::remove_dir_all(plan.dataset_root.join("tables/okx_kline_1s_reference")).unwrap();
+    fs::remove_dir_all(plan.dataset_root.join("tables/binance_kline_1s_reference")).unwrap();
     fs::remove_dir_all(plan.dataset_root.join("tables/polymarket_settlement")).unwrap();
 
     let rows = build_depth_feature(&plan).unwrap();
@@ -324,7 +324,7 @@ fn event_index_rows_match_declared_interface_fields() {
     assert!(!rows[0].payload_row_hash.is_empty());
 
     let reference = read_parquet_table::<BinanceKline1sReferenceRow>(
-        &plan.dataset_root.join("tables/okx_kline_1s_reference"),
+        &plan.dataset_root.join("tables/binance_kline_1s_reference"),
     )
     .unwrap();
     assert_eq!(reference[0].symbol, "BTCUSDT");
@@ -569,7 +569,7 @@ fn prepare_caches_downloads_reference_and_settlement_inputs() {
     build_facts(&plan).unwrap();
 
     let reference_rows = read_parquet_table::<BinanceKline1sReferenceRow>(
-        &plan.dataset_root.join("tables/okx_kline_1s_reference"),
+        &plan.dataset_root.join("tables/binance_kline_1s_reference"),
     )
     .unwrap();
     assert_eq!(reference_rows.len(), 2);

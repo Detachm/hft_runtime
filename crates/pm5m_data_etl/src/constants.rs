@@ -7,7 +7,7 @@ pub(crate) const EXPORT_MANIFEST: &str = "export_manifest.json";
 
 pub(crate) const TABLE_MARKET_DIM: &str = "tables/market_dim";
 pub(crate) const TABLE_BOOK_TOP10: &str = "tables/polymarket_book_top10";
-pub(crate) const TABLE_BINANCE_REFERENCE: &str = "tables/okx_kline_1s_reference";
+pub(crate) const TABLE_BINANCE_REFERENCE: &str = "tables/binance_kline_1s_reference";
 pub(crate) const TABLE_SETTLEMENT: &str = "tables/polymarket_settlement";
 pub(crate) const TABLE_INPUT_AVAILABILITY: &str = "tables/input_availability";
 pub(crate) const TABLE_DEPTH_FEATURE: &str = "derived/depth_feature_stream_v1_rust_all";
