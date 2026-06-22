@@ -1,8 +1,7 @@
-use crate::book_state_cache::{book_state_cache_book_table_paths, read_book_state_cache_catalog};
 use crate::cache::{input_availability_from_cache_record, read_cached_records};
 use crate::constants::{
-    MATERIALIZATION_REPORT, TABLE_BINANCE_REFERENCE, TABLE_BOOK_TOP10, TABLE_INPUT_AVAILABILITY,
-    TABLE_MARKET_DIM, TABLE_SETTLEMENT,
+    MATERIALIZATION_REPORT, REFERENCE_LOOKBACK_NS, TABLE_BINANCE_REFERENCE, TABLE_BOOK_TOP10,
+    TABLE_INPUT_AVAILABILITY, TABLE_MARKET_DIM, TABLE_SETTLEMENT,
 };
 use crate::manifest::{
     base_dataset_manifest, cache_group_hash, cache_manifest_path, dataset_path, existing_hash,
@@ -11,22 +10,19 @@ use crate::manifest::{
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
 use market_data_etl_core::{
-    for_each_parquet_table_row, hash_path, verify_parquet_zstd_table, write_json_file_pretty,
-    write_parquet_table, BookLevel, ParquetTableStreamWriter, TableWriteReport,
+    hash_path, write_json_file_pretty, write_parquet_table, BookLevel, ParquetTableStreamWriter,
+    TableWriteReport,
 };
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 const DEFAULT_BOOK_PART_ROWS: usize = 100_000;
-const REFERENCE_WINDOW_WARMUP_NS: i64 = 5_000_000_000;
-
 pub fn build_facts(plan: &PipelinePlan) -> Result<MaterializationReport> {
     std::fs::create_dir_all(&plan.dataset_root)
         .with_context(|| format!("create dataset root {}", plan.dataset_root.display()))?;
 
     let cache_manifest = read_cache_manifest(plan)?;
-    let (book_report, market_report, market_rows) = build_or_reuse_book_and_market_tables(plan)?;
-    let binance_rows = build_binance_reference_rows(plan, &cache_manifest)?;
+    let (book_report, market_report, market_rows) = build_book_and_market_tables(plan)?;
+    let binance_rows = build_binance_reference_rows(plan, &cache_manifest, &market_rows)?;
     let settlement_rows = build_settlement_rows(plan, &cache_manifest, &market_rows)?;
     let availability_rows = cache_manifest
         .records
@@ -92,92 +88,21 @@ pub fn build_facts(plan: &PipelinePlan) -> Result<MaterializationReport> {
     Ok(report)
 }
 
-fn build_or_reuse_book_and_market_tables(
+fn build_book_and_market_tables(
     plan: &PipelinePlan,
 ) -> Result<(TableWriteReport, TableWriteReport, Vec<MarketDimRow>)> {
-    let book_path = dataset_path(plan, TABLE_BOOK_TOP10);
-    let market_path = dataset_path(plan, TABLE_MARKET_DIM);
-    let symbol_filter = MarketSymbolFilter::from_plan(plan)?;
-    if book_path.exists() && market_path.exists() {
-        verify_parquet_zstd_table(&book_path, TABLE_BOOK_TOP10)?;
-        verify_parquet_zstd_table(&market_path, TABLE_MARKET_DIM)?;
-        let market_rows = market_data_etl_core::read_parquet_table::<MarketDimRow>(&market_path)?;
-        let reusable = !market_rows.is_empty()
-            && market_rows
-                .iter()
-                .all(|row| symbol_filter.allows(&row.symbol));
-        if reusable {
-            eprintln!(
-                "reusing canonical Polymarket book and market tables under {}",
-                plan.dataset_root.display()
-            );
-            return Ok((
-                existing_parquet_report(&book_path)?,
-                existing_parquet_report(&market_path)?,
-                market_rows,
-            ));
-        }
-    }
     if let Some(cache_root) = plan.book_state_cache_root.as_deref() {
-        return build_book_and_market_tables_from_cache(plan, cache_root);
-    }
-    bail!("build-facts requires book_state_cache_root pointing to HFTBOOK2/HFTIDX-era book cache")
-}
-
-fn build_book_and_market_tables_from_cache(
-    plan: &PipelinePlan,
-    cache_root: &std::path::Path,
-) -> Result<(TableWriteReport, TableWriteReport, Vec<MarketDimRow>)> {
-    if pm5m_market_cache::read_book_cache2_catalog(cache_root).is_ok() {
         return build_book_and_market_tables_from_hftbook_cache(plan, cache_root);
     }
-    let catalog = read_book_state_cache_catalog(cache_root)?;
-    let book_path = dataset_path(plan, TABLE_BOOK_TOP10);
-    let market_path = dataset_path(plan, TABLE_MARKET_DIM);
-    let symbol_filter = MarketSymbolFilter::from_plan(plan)?;
-    let part_limit = book_part_row_limit();
-    let mut writer = ParquetTableStreamWriter::new(&book_path, Some("local_recv_ts_ns"))?;
-    let mut chunk = Vec::<PolymarketBookTop10Row>::with_capacity(part_limit.min(16_384));
-    let mut market_acc = MarketDimAccumulator::default();
-    let mut output_rows = 0usize;
-
-    for cached_book_path in book_state_cache_book_table_paths(cache_root, &catalog) {
-        for_each_parquet_table_row::<PolymarketBookTop10Row, _>(&cached_book_path, |row| {
-            if !ts_in_plan_window(row.local_recv_ts_ns, plan) || !symbol_filter.allows(&row.symbol)
-            {
-                return Ok(());
-            }
-            market_acc.update(&row)?;
-            chunk.push(row);
-            output_rows += 1;
-            flush_book_chunk_if_needed(&mut writer, &mut chunk, part_limit)
-        })
-        .with_context(|| format!("read book state cache {}", cached_book_path.display()))?;
-    }
-
-    if output_rows == 0 {
-        bail!(
-            "book state cache {} produced no rows for requested window/market filter",
-            cache_root.display()
-        );
-    }
-
-    flush_book_chunk(&mut writer, &mut chunk)?;
-    let book_report = writer.finish()?;
-    let market_rows = market_acc.into_rows()?;
-    let market_report =
-        write_parquet_table(&market_path, &market_rows, Some("window_start_ts_ns"))?;
-    eprintln!(
-        "canonical Polymarket book state materialized from cache: {} row(s) across {} byte(s)",
-        book_report.row_count, book_report.byte_count
-    );
-    Ok((book_report, market_report, market_rows))
+    bail!("build-facts requires book_state_cache_root pointing to HFTBOOK2 book cache")
 }
 
 fn build_book_and_market_tables_from_hftbook_cache(
     plan: &PipelinePlan,
     cache_root: &std::path::Path,
 ) -> Result<(TableWriteReport, TableWriteReport, Vec<MarketDimRow>)> {
+    pm5m_market_cache::read_book_cache2_catalog(cache_root)
+        .with_context(|| format!("read HFTBOOK2 book cache {}", cache_root.display()))?;
     let book_path = dataset_path(plan, TABLE_BOOK_TOP10);
     let market_path = dataset_path(plan, TABLE_MARKET_DIM);
     let symbol_filter = MarketSymbolFilter::from_plan(plan)?;
@@ -222,16 +147,6 @@ fn build_book_and_market_tables_from_hftbook_cache(
         book_report.row_count, book_report.byte_count
     );
     Ok((book_report, market_report, market_rows))
-}
-
-pub(crate) fn market_dim_rows_from_book_rows(
-    rows: &[PolymarketBookTop10Row],
-) -> Result<Vec<MarketDimRow>> {
-    let mut market_acc = MarketDimAccumulator::default();
-    for row in rows {
-        market_acc.update(row)?;
-    }
-    market_acc.into_rows()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -384,57 +299,10 @@ fn book_part_row_limit() -> usize {
         .unwrap_or(DEFAULT_BOOK_PART_ROWS)
 }
 
-fn ts_in_plan_window(ts_ns: i64, plan: &PipelinePlan) -> bool {
-    plan.raw_start_ts_ns.is_none_or(|start| ts_ns >= start)
-        && plan.raw_end_ts_ns.is_none_or(|end| ts_ns < end)
-}
-
-fn existing_parquet_report(table_path: &std::path::Path) -> Result<TableWriteReport> {
-    let schema_path = table_path.join("_schema.json");
-    let schema: Value = serde_json::from_reader(
-        std::fs::File::open(&schema_path)
-            .with_context(|| format!("open {}", schema_path.display()))?,
-    )?;
-    let parts = schema
-        .get("part_files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("table {} missing part_files", table_path.display()))?;
-    let row_count = parts
-        .iter()
-        .filter_map(|part| part.get("row_count").and_then(Value::as_u64))
-        .sum::<u64>() as usize;
-    let byte_count = parts
-        .iter()
-        .filter_map(|part| part.get("byte_count").and_then(Value::as_u64))
-        .sum::<u64>();
-    let first_part = parts
-        .first()
-        .and_then(|part| part.get("file").and_then(Value::as_str))
-        .unwrap_or("part-00000.parquet");
-    let part_hash = parts
-        .first()
-        .and_then(|part| part.get("sha256").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    Ok(TableWriteReport {
-        table_path: table_path.to_path_buf(),
-        part_path: table_path.join(first_part),
-        schema_path,
-        row_count,
-        byte_count,
-        part_hash,
-        table_hash: hash_path(table_path)?,
-    })
-}
-
 fn canonical_market_symbol(symbol: &str) -> Option<String> {
     let upper = symbol.trim().to_ascii_uppercase();
     if upper.is_empty() {
         return None;
-    }
-    match upper.as_str() {
-        "BTC" | "ETH" | "SOL" => return Some(format!("{upper}-5M")),
-        _ => {}
     }
     let (asset, horizon) = upper.split_once('-')?;
     if asset.is_empty()
@@ -535,8 +403,10 @@ impl MarketDimAccumulator {
 fn build_binance_reference_rows(
     plan: &PipelinePlan,
     cache_manifest: &CacheManifest,
+    market_rows: &[MarketDimRow],
 ) -> Result<Vec<BinanceKline1sReferenceRow>> {
     let mut rows = Vec::new();
+    let required_ranges = required_reference_ranges(market_rows)?;
     for record in cache_manifest.records.iter().filter(|record| {
         record.group == CacheGroup::Binance1sReference
             && record.status == CacheRecordStatus::Available
@@ -554,6 +424,14 @@ fn build_binance_reference_rows(
                 .clone()
                 .or_else(|| record.symbol.clone())
                 .ok_or_else(|| anyhow!("missing Binance symbol for cache {}", record.name))?;
+            let normalized_symbol = normalize_reference_symbol(&symbol);
+            let Some((required_start, required_end)) = required_ranges.get(&normalized_symbol)
+            else {
+                continue;
+            };
+            if raw.bar_close_ts_ns < *required_start || raw.bar_close_ts_ns > *required_end {
+                continue;
+            }
             let synthetic_local_recv_ts_ns = raw
                 .bar_close_ts_ns
                 .checked_add(plan.reference_latency_ms * 1_000_000)
@@ -565,8 +443,8 @@ fn build_binance_reference_rows(
             let mut row = BinanceKline1sReferenceRow {
                 schema_version: 1,
                 dataset_format: BINANCE_REFERENCE_FORMAT.to_string(),
-                primary_key: format!("bn_1s:{}:{}", symbol, raw.bar_close_ts_ns),
-                symbol,
+                primary_key: format!("bn_1s:{}:{}", normalized_symbol, raw.bar_close_ts_ns),
+                symbol: normalized_symbol,
                 bar_open_ts_ns: raw.bar_open_ts_ns,
                 bar_close_ts_ns: raw.bar_close_ts_ns,
                 synthetic_local_recv_ts_ns,
@@ -593,10 +471,55 @@ fn build_binance_reference_rows(
     Ok(rows)
 }
 
+fn required_reference_ranges(market_rows: &[MarketDimRow]) -> Result<BTreeMap<String, (i64, i64)>> {
+    let mut ranges = BTreeMap::<String, (i64, i64)>::new();
+    for row in market_rows {
+        let symbol = reference_symbol_for_market(&row.symbol)
+            .ok_or_else(|| anyhow!("unsupported market symbol '{}'", row.symbol))?;
+        let start = row
+            .window_start_ts_ns
+            .saturating_sub(REFERENCE_LOOKBACK_NS)
+            .max(0);
+        let end = row.window_end_ts_ns;
+        ranges
+            .entry(symbol)
+            .and_modify(|(min_start, max_end)| {
+                *min_start = (*min_start).min(start);
+                *max_end = (*max_end).max(end);
+            })
+            .or_insert((start, end));
+    }
+    Ok(ranges)
+}
+
+fn reference_symbol_for_market(symbol: &str) -> Option<String> {
+    let upper = symbol.trim().to_ascii_uppercase();
+    let asset = upper
+        .split_once('-')
+        .map(|(asset, _)| asset)
+        .unwrap_or(upper.as_str());
+    if asset.is_empty() || !asset.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        None
+    } else if asset.ends_with("USDT") {
+        Some(asset.to_string())
+    } else {
+        Some(format!("{asset}USDT"))
+    }
+}
+
+fn normalize_reference_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if upper.ends_with("USDT") {
+        upper
+    } else {
+        reference_symbol_for_market(&upper).unwrap_or(upper)
+    }
+}
+
 fn reference_ts_in_plan_window(ts_ns: i64, plan: &PipelinePlan) -> bool {
     let after_start = match plan.raw_start_ts_ns {
         Some(start) => {
-            let warm_start = start.saturating_sub(REFERENCE_WINDOW_WARMUP_NS);
+            let warm_start = start.saturating_sub(REFERENCE_LOOKBACK_NS);
             ts_ns >= warm_start
         }
         None => true,

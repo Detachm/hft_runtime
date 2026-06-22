@@ -14,9 +14,7 @@ mod prepare_caches;
 pub mod types;
 
 pub use book_state_cache::{
-    append_book_state_cache_partition, build_book_state_cache, read_book_state_cache_catalog,
-    AppendBookStateCachePartitionOptions, BookStateCacheAppendReport, BookStateCacheBuildReport,
-    BookStateCacheCatalog, BookStateCachePartition, BuildBookStateCacheOptions,
+    build_book_state_cache, BookStateCacheBuildReport, BuildBookStateCacheOptions,
 };
 pub use fetch::{DefaultFetcher, Fetcher};
 pub use pipeline::{

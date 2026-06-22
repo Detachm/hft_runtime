@@ -1,5 +1,5 @@
 use crate::cache::read_cached_records;
-use crate::constants::{TABLE_BOOK_TOP10, TABLE_MARKET_DIM};
+use crate::constants::{REFERENCE_LOOKBACK_MS, TABLE_BOOK_TOP10, TABLE_MARKET_DIM};
 use crate::manifest::{cache_manifest_path, dataset_path, relative_to};
 use crate::types::*;
 use anyhow::{anyhow, bail, Context, Result};
@@ -22,7 +22,6 @@ use std::time::Duration;
 const BINANCE_DATA_API_BASE: &str = "https://data-api.binance.vision";
 const BINANCE_API_BASE: &str = "https://api.binance.com";
 const POLYMARKET_CLOB_BASE: &str = "https://clob.polymarket.com";
-const RANGE_PAD_MS: i64 = 5_000;
 const DAY_MS: i64 = 86_400_000;
 const BINANCE_DAY_CACHE_DIR: &str = "binance_1s";
 
@@ -169,6 +168,25 @@ fn prepare_binance_reference_day(
         .join(&day);
 
     if target.exists() && !options.refresh_reference {
+        let cached_rows = read_cached_records::<RawBinanceKline1s>(&target)
+            .with_context(|| format!("read Binance reference cache {}", target.display()))?;
+        if let Err(err) =
+            validate_binance_1s_continuity(exchange_symbol, day_start_ms, day_end_ms, &cached_rows)
+        {
+            return Ok(CacheRecord {
+                group: CacheGroup::Binance1sReference,
+                name,
+                source_url,
+                symbol: Some(exchange_symbol.to_string()),
+                start_ts_ns: ms_to_ns(day_start_ms)?,
+                end_ts_ns: ms_to_ns(day_end_ms)?,
+                status: CacheRecordStatus::Failed,
+                cache_path: None,
+                missing_count: 1,
+                failure_reason: Some(format!("cached Binance 1s coverage invalid: {err:#}")),
+                response_hash: None,
+            });
+        }
         return Ok(CacheRecord {
             group: CacheGroup::Binance1sReference,
             name,
@@ -199,6 +217,25 @@ fn prepare_binance_reference_day(
             response_hash: None,
         }),
         Ok(rows) => {
+            if let Err(err) =
+                validate_binance_1s_continuity(exchange_symbol, day_start_ms, day_end_ms, &rows)
+            {
+                return Ok(CacheRecord {
+                    group: CacheGroup::Binance1sReference,
+                    name,
+                    source_url,
+                    symbol: Some(exchange_symbol.to_string()),
+                    start_ts_ns: ms_to_ns(day_start_ms)?,
+                    end_ts_ns: ms_to_ns(day_end_ms)?,
+                    status: CacheRecordStatus::Failed,
+                    cache_path: None,
+                    missing_count: 1,
+                    failure_reason: Some(format!(
+                        "downloaded Binance 1s coverage invalid: {err:#}"
+                    )),
+                    response_hash: None,
+                });
+            }
             write_parquet_table(&target, &rows, Some("bar_open_ts_ns"))?;
             Ok(CacheRecord {
                 group: CacheGroup::Binance1sReference,
@@ -541,6 +578,57 @@ fn download_binance_1s(
     Ok(rows.into_values().collect())
 }
 
+fn validate_binance_1s_continuity(
+    exchange_symbol: &str,
+    start_ms: i64,
+    end_ms: i64,
+    rows: &[RawBinanceKline1s],
+) -> Result<()> {
+    if rows.is_empty() {
+        bail!("empty Binance 1s rows");
+    }
+    if end_ms <= start_ms {
+        bail!("Binance range end_ms must be greater than start_ms");
+    }
+    let mut by_open = BTreeMap::new();
+    for row in rows {
+        let symbol = row.symbol.as_deref().unwrap_or(exchange_symbol);
+        if !symbol.eq_ignore_ascii_case(exchange_symbol) {
+            bail!("unexpected Binance symbol {symbol}, expected {exchange_symbol}");
+        }
+        let open_ms = row.bar_open_ts_ns / 1_000_000;
+        let close_ms = row.bar_close_ts_ns / 1_000_000;
+        if close_ms != open_ms + 1_000 {
+            bail!("invalid Binance 1s close for open_ms {open_ms}");
+        }
+        if by_open.insert(open_ms, ()).is_some() {
+            bail!("duplicate Binance 1s open_ms {open_ms}");
+        }
+    }
+    let mut missing = 0usize;
+    let mut examples = Vec::new();
+    let mut cursor = start_ms;
+    while cursor < end_ms {
+        if !by_open.contains_key(&cursor) {
+            missing += 1;
+            if examples.len() < 8 {
+                examples.push(cursor.to_string());
+            }
+        }
+        cursor = cursor.saturating_add(1_000);
+        if cursor == i64::MAX {
+            break;
+        }
+    }
+    if missing > 0 {
+        bail!(
+            "missing {missing} Binance 1s row(s) for {exchange_symbol}; examples {}",
+            examples.join(",")
+        );
+    }
+    Ok(())
+}
+
 fn fetch_binance_klines(http: &dyn CachePreparationHttp, params: &str) -> Result<Value> {
     let mut failures = Vec::new();
     for base in [BINANCE_DATA_API_BASE, BINANCE_API_BASE] {
@@ -668,8 +756,8 @@ fn parse_settlement_payload(
 
 fn settlement_token_matches(token: &Value, asset: &ExpectedSettlementAsset) -> bool {
     let token_id = string_value(token, &["token_id", "tokenId", "asset_id", "assetId"]);
-    if token_id.as_deref() == Some(asset.asset_id.as_str()) {
-        return true;
+    if let Some(token_id) = token_id {
+        return token_id == asset.asset_id;
     }
     string_value(token, &["outcome"])
         .map(|outcome| normalize_outcome(&outcome) == normalize_outcome(&asset.outcome))
@@ -715,8 +803,8 @@ fn infer_reference_ranges(
         .map(|(asset, (min_ns, max_ns))| {
             let min_ms = ns_to_ms_floor(min_ns);
             let max_ms = ns_to_ms_floor(max_ns);
-            let start_ms = ((min_ms / 1_000) * 1_000 - RANGE_PAD_MS).max(0);
-            let end_ms = ((max_ms / 1_000) + 1) * 1_000 + RANGE_PAD_MS;
+            let start_ms = ((min_ms / 1_000) * 1_000 - REFERENCE_LOOKBACK_MS).max(0);
+            let end_ms = ((max_ms / 1_000) + 1) * 1_000 + REFERENCE_LOOKBACK_MS;
             Ok((asset, ReferenceRange { start_ms, end_ms }))
         })
         .collect()

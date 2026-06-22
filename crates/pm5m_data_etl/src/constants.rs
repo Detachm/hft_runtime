@@ -13,6 +13,10 @@ pub(crate) const TABLE_INPUT_AVAILABILITY: &str = "tables/input_availability";
 pub(crate) const TABLE_DEPTH_FEATURE: &str = "derived/depth_feature_stream_v1_rust_all";
 pub(crate) const TABLE_EVENT_INDEX: &str = "streams/pm5m_standard_event_index_v1";
 
+pub(crate) const SECOND_NS: i64 = 1_000_000_000;
+pub(crate) const REFERENCE_LOOKBACK_NS: i64 = 60 * SECOND_NS;
+pub(crate) const REFERENCE_LOOKBACK_MS: i64 = REFERENCE_LOOKBACK_NS / 1_000_000;
+
 pub(crate) const BANNED_STRATEGY_FIELDS: &[&str] = &[
     "fair_value",
     "model_probability",

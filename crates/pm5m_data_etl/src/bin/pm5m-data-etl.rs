@@ -34,7 +34,7 @@ enum Command {
         raw_start_ts_ns: Option<i64>,
         #[arg(long)]
         raw_end_ts_ns: Option<i64>,
-        #[arg(long, default_value_t = 1_000)]
+        #[arg(long, default_value_t = 200)]
         reference_latency_ms: i64,
         #[arg(long)]
         fail_closed_on_missing_reference: bool,

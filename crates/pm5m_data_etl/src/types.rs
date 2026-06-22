@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 pub const PLAN_DATASET_FORMAT: &str = "pm5m_pipeline_plan.v1";
 pub const CACHE_MANIFEST_FORMAT: &str = "pm5m_input_cache_manifest.v1";
-pub const BOOK_STATE_CACHE_FORMAT: &str = "pm5m_book_state_cache.v1";
 pub const MARKET_DIM_FORMAT: &str = "pm5m_market_dim.v1";
 pub const BOOK_TOP10_FORMAT: &str = "polymarket_book_state_top10.v1";
 pub const BINANCE_REFERENCE_FORMAT: &str = "pm5m_binance_kline_1s_reference.v1";
@@ -59,7 +58,7 @@ impl PipelinePlan {
             book_state_cache_root: None,
             raw_start_ts_ns: None,
             raw_end_ts_ns: None,
-            reference_latency_ms: 1_000,
+            reference_latency_ms: 200,
             accept_fail_closed_on_missing_reference: false,
             accept_fail_closed_on_unsettled_settlement: true,
             market_symbol_allowlist: Vec::new(),
@@ -401,80 +400,4 @@ pub struct ExportManifest {
 pub struct ExportedFileRef {
     pub byte_count: u64,
     pub sha256: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RawHealthReport {
-    pub schema_version: u32,
-    pub dataset_format: String,
-    pub raw_root: PathBuf,
-    pub state_root: Option<PathBuf>,
-    pub generated_ts_ns: i64,
-    pub max_age_ms: i64,
-    pub healthy: bool,
-    pub manifest_count: usize,
-    pub record_count: u64,
-    pub segment_bytes: u64,
-    pub min_ts_ns: Option<i64>,
-    pub max_ts_ns: Option<i64>,
-    pub latest_manifest_path: Option<PathBuf>,
-    pub latest_manifest_mtime_ts_ns: Option<i64>,
-    pub state_path: Option<PathBuf>,
-    pub state_exists: bool,
-    pub state_last_recv_ts_ns: Option<i64>,
-    pub state_connection_id: Option<u64>,
-    pub state_subscription_epoch: Option<u64>,
-    pub state_asset_count: Option<usize>,
-    pub state_assets_missing_market_metadata: Option<usize>,
-    pub state_last_error: Option<String>,
-    pub latest_data_ts_ns: Option<i64>,
-    pub latest_data_age_ms: Option<i64>,
-    pub violations: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RawCoverageReport {
-    pub schema_version: u32,
-    pub dataset_format: String,
-    pub raw_root: PathBuf,
-    pub stream_filter: Option<String>,
-    pub generated_ts_ns: i64,
-    pub include_record_stats: bool,
-    pub manifest_count: usize,
-    pub record_count: u64,
-    pub segment_bytes: u64,
-    pub min_ts_ns: Option<i64>,
-    pub max_ts_ns: Option<i64>,
-    pub first_hour_bucket: Option<i64>,
-    pub last_hour_bucket: Option<i64>,
-    pub expected_hour_count: usize,
-    pub present_hour_count: usize,
-    pub missing_hour_count: usize,
-    pub gaps: Vec<RawCoverageGap>,
-    pub hours: Vec<RawCoverageHour>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RawCoverageGap {
-    pub start_hour_bucket: i64,
-    pub end_hour_bucket_exclusive: i64,
-    pub start_ts_ns: i64,
-    pub end_ts_ns: i64,
-    pub hour_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RawCoverageHour {
-    pub hour_bucket: i64,
-    pub start_ts_ns: i64,
-    pub end_ts_ns: i64,
-    pub manifest_count: usize,
-    pub record_count: u64,
-    pub segment_bytes: u64,
-    pub min_ts_ns: Option<i64>,
-    pub max_ts_ns: Option<i64>,
-    pub condition_count: Option<usize>,
-    pub missing_market_metadata_count: Option<u64>,
-    pub symbol_counts: BTreeMap<String, u64>,
-    pub event_type_counts: BTreeMap<String, u64>,
 }

@@ -1,12 +1,11 @@
 use anyhow::{bail, Result};
 use market_data_etl_core::{hash_path, read_parquet_table, write_parquet_table};
 use pm5m_data_etl::{
-    accept, append_book_state_cache_partition, build_book_state_cache, build_depth_feature,
-    build_event_index, build_facts, export_dataset, prepare_caches, sync_inputs,
-    AppendBookStateCachePartitionOptions, BinanceKline1sReferenceRow, BuildBookStateCacheOptions,
-    CachePreparationHttp, CacheRecordStatus, CacheSourceSpec, DefaultFetcher, ExportManifest,
-    InputAvailabilityRow, MarketDimRow, PipelinePlan, PolymarketBookTop10Row,
-    PolymarketSettlementRow, SettlementStatus, StandardEventIndexRow,
+    accept, build_book_state_cache, build_depth_feature, build_event_index, build_facts,
+    export_dataset, prepare_caches, sync_inputs, BinanceKline1sReferenceRow,
+    BuildBookStateCacheOptions, CachePreparationHttp, CacheRecordStatus, CacheSourceSpec,
+    DefaultFetcher, ExportManifest, InputAvailabilityRow, MarketDimRow, PipelinePlan,
+    PolymarketBookTop10Row, PolymarketSettlementRow, SettlementStatus, StandardEventIndexRow,
 };
 use pm5m_market_cache::{BookCacheRow, BookLevelMicros, WriteBookCache2Options};
 use serde::Serialize;
@@ -73,6 +72,18 @@ fn full_chain_materializes_accepts_and_is_deterministic() {
     .unwrap();
     assert_eq!(fact_hash_1, fact_hash_2);
     assert_eq!(event_hash_1, event_hash_2);
+}
+
+#[test]
+fn pipeline_plan_default_reference_latency_matches_live_assumption() {
+    let fixture = Fixture::new();
+    let plan = PipelinePlan::new(
+        vec![fixture.raw_root.clone()],
+        fixture.root.path().join("plan-default"),
+        fixture.root.path().join("cache-default"),
+        fixture.root.path().join("dataset-default"),
+    );
+    assert_eq!(plan.reference_latency_ms, 200);
 }
 
 #[test]
@@ -227,6 +238,19 @@ fn missing_binance_reference_is_recorded_and_fail_closed_accept_rejects() {
     build_event_index(&plan).unwrap();
     let err = accept(&plan).unwrap_err().to_string();
     assert!(err.contains("missing Binance reference input"));
+}
+
+#[test]
+fn available_binance_reference_with_coverage_gaps_fail_closed_rejects() {
+    let fixture = Fixture::new();
+    let plan = fixture.plan(true);
+
+    sync_inputs(&plan, &DefaultFetcher).unwrap();
+    build_facts(&plan).unwrap();
+    build_event_index(&plan).unwrap();
+
+    let err = accept(&plan).unwrap_err().to_string();
+    assert!(err.contains("Binance reference coverage missing"), "{err}");
 }
 
 #[test]
@@ -407,6 +431,41 @@ fn ws_raw_market_symbol_allowlist_filters_after_canonicalization() {
 }
 
 #[test]
+fn bare_market_symbol_allowlist_is_rejected_as_ambiguous() {
+    let fixture = Fixture::new_ws_raw();
+    let mut plan = fixture.plan(false);
+    plan.market_symbol_allowlist = vec!["BTC".to_string()];
+
+    let err = build_facts(&plan).unwrap_err().to_string();
+    assert!(err.contains("invalid market symbol allowlist entry 'BTC'"));
+}
+
+#[test]
+fn build_facts_rebuilds_when_plan_window_changes() {
+    let fixture = Fixture::new();
+    let mut plan = fixture.plan(false);
+    sync_inputs(&plan, &DefaultFetcher).unwrap();
+    build_facts(&plan).unwrap();
+    assert_eq!(
+        read_parquet_table::<PolymarketBookTop10Row>(
+            &plan.dataset_root.join("tables/polymarket_book_top10")
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+
+    plan.raw_end_ts_ns = Some(2_000_050_000);
+    build_facts(&plan).unwrap();
+    let rows = read_parquet_table::<PolymarketBookTop10Row>(
+        &plan.dataset_root.join("tables/polymarket_book_top10"),
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].outcome, "YES");
+}
+
+#[test]
 fn book_state_cache_feeds_build_facts_without_raw_roots() {
     let fixture = Fixture::new_ws_raw();
     let cache_root = fixture.root.path().join("book_state_cache");
@@ -449,48 +508,6 @@ fn book_state_cache_feeds_build_facts_without_raw_roots() {
 
     assert_eq!(cached_rows, direct_rows);
     assert_eq!(cached_markets.len(), 2);
-}
-
-#[test]
-fn appended_book_state_cache_partition_feeds_build_facts() {
-    let fixture = Fixture::new_ws_raw();
-    let direct_plan = fixture.plan(false);
-    build_facts(&direct_plan).unwrap();
-    let direct_rows = read_parquet_table::<PolymarketBookTop10Row>(
-        &direct_plan
-            .dataset_root
-            .join("tables/polymarket_book_top10"),
-    )
-    .unwrap();
-
-    let cache_root = fixture.root.path().join("book_state_cache_partitioned");
-    let append_report = append_book_state_cache_partition(
-        &AppendBookStateCachePartitionOptions {
-            cache_root: cache_root.clone(),
-            partition_id: "fixture_ws_flush_1".to_string(),
-            raw_roots: vec![fixture.raw_root.clone()],
-        },
-        &direct_rows,
-    )
-    .unwrap();
-    assert_eq!(append_report.book_row_count, 3);
-
-    let mut cached_plan = fixture.plan(false);
-    cached_plan.raw_roots.clear();
-    cached_plan.dataset_root = fixture
-        .root
-        .path()
-        .join("dataset-from-partitioned-book-state-cache");
-    cached_plan.book_state_cache_root = Some(cache_root);
-    build_facts(&cached_plan).unwrap();
-    let cached_rows = read_parquet_table::<PolymarketBookTop10Row>(
-        &cached_plan
-            .dataset_root
-            .join("tables/polymarket_book_top10"),
-    )
-    .unwrap();
-
-    assert_eq!(cached_rows, direct_rows);
 }
 
 #[test]
@@ -572,10 +589,13 @@ fn prepare_caches_downloads_reference_and_settlement_inputs() {
         &plan.dataset_root.join("tables/binance_kline_1s_reference"),
     )
     .unwrap();
-    assert_eq!(reference_rows.len(), 2);
+    assert_eq!(reference_rows.len(), 300);
     assert_eq!(reference_rows[0].symbol, "BTCUSDT");
     assert_eq!(reference_rows[0].bar_open_ts_ns, 0);
-    assert_eq!(reference_rows[1].bar_open_ts_ns, 1_000_000_000);
+    assert_eq!(
+        reference_rows.last().unwrap().bar_open_ts_ns,
+        299_000_000_000
+    );
 
     let settlement_rows = read_parquet_table::<PolymarketSettlementRow>(
         &plan.dataset_root.join("tables/polymarket_settlement"),
@@ -744,10 +764,40 @@ fn prepare_caches_records_and_retries_failed_settlement_cache() {
     assert!(!refreshed.contains("\"failure_reason\""));
 }
 
+#[test]
+fn prepare_caches_does_not_match_settlement_by_outcome_when_token_id_mismatches() {
+    let fixture = Fixture::new();
+    let mut plan = fixture.plan(false);
+    plan.binance_sources.clear();
+    plan.settlement_sources.clear();
+
+    build_facts(&plan).unwrap();
+    let manifest = prepare_caches(
+        &plan,
+        &FakeCacheHttp {
+            bad_settlement_token_ids: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let settlement = manifest
+        .records
+        .iter()
+        .find(|record| record.name == "polymarket-settlement-shared")
+        .unwrap();
+    assert_eq!(settlement.missing_count, 2);
+    assert!(settlement
+        .failure_reason
+        .as_deref()
+        .unwrap()
+        .contains("token_not_found_in_clob_market_payload"));
+}
+
 #[derive(Debug, Default)]
 struct FakeCacheHttp {
     fail_binance: bool,
     fail_settlement: bool,
+    bad_settlement_token_ids: bool,
     calls: AtomicUsize,
 }
 
@@ -764,19 +814,45 @@ impl CachePreparationHttp for FakeCacheHttp {
             if self.fail_binance {
                 bail!("fixture Binance failure");
             }
-            return Ok(
-                br#"[[0,"100.0","101.0","99.0","100.5","42.0",999,"4200.0"],[1000,"100.5","102.0","100.0","101.5","43.0",1999,"4343.0"]]"#
-                    .to_vec(),
-            );
+            let start_ms = query_param_i64(url, "startTime").unwrap_or(0);
+            let end_ms = query_param_i64(url, "endTime").unwrap_or(start_ms);
+            let limit = query_param_i64(url, "limit").unwrap_or(1000).max(1) as usize;
+            let mut rows = Vec::new();
+            let mut open_ms = start_ms;
+            while open_ms <= end_ms && rows.len() < limit {
+                rows.push(json!([
+                    open_ms,
+                    "100.0",
+                    "101.0",
+                    "99.0",
+                    "100.5",
+                    "42.0",
+                    open_ms + 999,
+                    "4200.0"
+                ]));
+                open_ms += 1_000;
+            }
+            return Ok(serde_json::to_vec(&rows).unwrap());
         }
         if url.ends_with("/markets/cond-1") {
             if self.fail_settlement {
                 bail!("fixture settlement failure");
             }
+            if self.bad_settlement_token_ids {
+                return Ok(br#"{"condition_id":"cond-1","closed":true,"tokens":[{"token_id":"wrong-yes","outcome":"YES","winner":true,"price":"1"},{"token_id":"wrong-no","outcome":"NO","winner":false,"price":"0"}]}"#.to_vec());
+            }
             return Ok(br#"{"condition_id":"cond-1","closed":true,"tokens":[{"token_id":"asset-yes","outcome":"YES","winner":true,"price":"1"},{"token_id":"asset-no","outcome":"NO","winner":false,"price":"0"}]}"#.to_vec());
         }
         bail!("unexpected fixture URL: {url}");
     }
+}
+
+fn query_param_i64(url: &str, key: &str) -> Option<i64> {
+    let query = url.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == key).then(|| value.parse::<i64>().ok()).flatten()
+    })
 }
 
 struct Fixture {
@@ -940,7 +1016,7 @@ impl Fixture {
             enrich_missing_clob_metadata: false,
             clob_metadata_cache_root: None,
             condition_allowlist_path: None,
-            poly_server_visible_time: false,
+            poly_server_visible_time: true,
             poly_incremental_latency_ms: pm5m_market_cache::DEFAULT_POLY_INCREMENTAL_LATENCY_MS,
             poly_incremental_freshness_guard_ms:
                 pm5m_market_cache::DEFAULT_POLY_INCREMENTAL_FRESHNESS_GUARD_MS,
@@ -1057,7 +1133,7 @@ fn write_fixture_book_cache(cache_root: &Path, rows: Vec<BookCacheRow>) {
             raw_end_ts_ns: None,
             market_symbol_allowlist: Vec::new(),
             overwrite: true,
-            poly_server_visible_time: false,
+            poly_server_visible_time: true,
             poly_incremental_latency_ms: pm5m_market_cache::DEFAULT_POLY_INCREMENTAL_LATENCY_MS,
             poly_incremental_freshness_guard_ms:
                 pm5m_market_cache::DEFAULT_POLY_INCREMENTAL_FRESHNESS_GUARD_MS,

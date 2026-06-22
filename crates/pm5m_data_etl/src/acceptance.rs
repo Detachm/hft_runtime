@@ -1,8 +1,7 @@
-use crate::book_state_cache::read_book_state_cache_catalog;
 use crate::constants::{
-    ACCEPTANCE_REPORT, BANNED_STRATEGY_FIELDS, TABLE_BINANCE_REFERENCE, TABLE_BOOK_TOP10,
-    TABLE_DEPTH_FEATURE, TABLE_EVENT_INDEX, TABLE_INPUT_AVAILABILITY, TABLE_MARKET_DIM,
-    TABLE_SETTLEMENT,
+    ACCEPTANCE_REPORT, BANNED_STRATEGY_FIELDS, REFERENCE_LOOKBACK_NS, SECOND_NS,
+    TABLE_BINANCE_REFERENCE, TABLE_BOOK_TOP10, TABLE_DEPTH_FEATURE, TABLE_EVENT_INDEX,
+    TABLE_INPUT_AVAILABILITY, TABLE_MARKET_DIM, TABLE_SETTLEMENT,
 };
 use crate::manifest::dataset_path;
 use crate::types::*;
@@ -11,6 +10,7 @@ use market_data_etl_core::{
     read_parquet_table, scan_json_fields, verify_parquet_zstd_table, write_json_file_pretty,
 };
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -18,11 +18,9 @@ pub fn accept(plan: &PipelinePlan) -> Result<AcceptanceReport> {
     let mut violations = Vec::new();
 
     if let Some(cache_root) = plan.book_state_cache_root.as_deref() {
-        if pm5m_market_cache::read_book_cache2_catalog(cache_root).is_err()
-            && read_book_state_cache_catalog(cache_root).is_err()
-        {
+        if pm5m_market_cache::read_book_cache2_catalog(cache_root).is_err() {
             violations.push(format!(
-                "book_state_cache_root must point to HFTBOOK2 or book-state cache: {}",
+                "book_state_cache_root must point to HFTBOOK2 cache: {}",
                 cache_root.display()
             ));
         }
@@ -102,21 +100,8 @@ pub fn accept(plan: &PipelinePlan) -> Result<AcceptanceReport> {
     }
 
     if plan.accept_fail_closed_on_missing_reference {
-        let availability_path = dataset_path(plan, TABLE_INPUT_AVAILABILITY);
-        let availability = if availability_path.exists() {
-            read_parquet_table::<InputAvailabilityRow>(&availability_path)?
-        } else {
-            Vec::new()
-        };
-        for row in availability {
-            if row.group == CacheGroup::Binance1sReference
-                && row.status != CacheRecordStatus::Available
-            {
-                violations.push(format!(
-                    "missing Binance reference input '{}' with status {:?}",
-                    row.name, row.status
-                ));
-            }
+        if let Err(err) = validate_binance_reference_complete(plan) {
+            violations.push(err.to_string());
         }
     }
 
@@ -155,19 +140,25 @@ fn validate_settlement_complete(plan: &PipelinePlan) -> Result<()> {
     } else {
         Vec::new()
     };
-    let by_asset = settlement_rows
-        .iter()
-        .map(|row| {
-            (
-                (
-                    row.condition_id.as_str(),
-                    row.asset_id.as_str(),
-                    row.outcome.as_str(),
-                ),
-                row,
-            )
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut by_asset = BTreeMap::new();
+    let mut duplicate_count = 0usize;
+    let mut duplicate_examples = Vec::new();
+    for row in &settlement_rows {
+        let key = (
+            row.condition_id.as_str(),
+            row.asset_id.as_str(),
+            row.outcome.as_str(),
+        );
+        if by_asset.insert(key, row).is_some() {
+            duplicate_count += 1;
+            if duplicate_examples.len() < 8 {
+                duplicate_examples.push(format!(
+                    "{} {} {}",
+                    row.condition_id, row.asset_id, row.outcome
+                ));
+            }
+        }
+    }
 
     let mut bad_count = 0usize;
     let mut examples = Vec::new();
@@ -207,6 +198,13 @@ fn validate_settlement_complete(plan: &PipelinePlan) -> Result<()> {
         }
     }
 
+    if duplicate_count > 0 {
+        bail!(
+            "Polymarket settlement fail-closed: {duplicate_count} duplicate asset row(s): {}",
+            duplicate_examples.join("; ")
+        );
+    }
+
     if bad_count > 0 {
         bail!(
             "Polymarket settlement fail-closed: {bad_count} missing or unsettled asset row(s): {}",
@@ -214,6 +212,169 @@ fn validate_settlement_complete(plan: &PipelinePlan) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_binance_reference_complete(plan: &PipelinePlan) -> Result<()> {
+    let mut violations = Vec::new();
+
+    let availability_path = dataset_path(plan, TABLE_INPUT_AVAILABILITY);
+    let availability = if availability_path.exists() {
+        read_parquet_table::<InputAvailabilityRow>(&availability_path)?
+    } else {
+        Vec::new()
+    };
+    let binance_availability = availability
+        .iter()
+        .filter(|row| row.group == CacheGroup::Binance1sReference)
+        .collect::<Vec<_>>();
+    if binance_availability.is_empty() {
+        violations.push("missing Binance reference input records".to_string());
+    }
+    for row in binance_availability {
+        if row.status != CacheRecordStatus::Available {
+            violations.push(format!(
+                "missing Binance reference input '{}' with status {:?}",
+                row.name, row.status
+            ));
+        }
+    }
+
+    let market_rows = read_parquet_table::<MarketDimRow>(&dataset_path(plan, TABLE_MARKET_DIM))?;
+    let reference_rows = read_parquet_table::<BinanceKline1sReferenceRow>(&dataset_path(
+        plan,
+        TABLE_BINANCE_REFERENCE,
+    ))?;
+    if reference_rows.is_empty() {
+        violations.push("Binance reference table is empty".to_string());
+    }
+
+    let mut primary_keys = BTreeSet::new();
+    let mut symbol_close_keys = BTreeSet::new();
+    let mut closes_by_symbol = BTreeMap::<String, BTreeSet<i64>>::new();
+    let mut duplicate_count = 0usize;
+    let mut duplicate_examples = Vec::new();
+    for row in reference_rows {
+        if !primary_keys.insert(row.primary_key.clone())
+            || !symbol_close_keys
+                .insert((normalize_reference_symbol(&row.symbol), row.bar_close_ts_ns))
+        {
+            duplicate_count += 1;
+            if duplicate_examples.len() < 8 {
+                duplicate_examples.push(format!("{} {}", row.symbol, row.bar_close_ts_ns));
+            }
+        }
+        closes_by_symbol
+            .entry(normalize_reference_symbol(&row.symbol))
+            .or_default()
+            .insert(row.bar_close_ts_ns);
+    }
+    if duplicate_count > 0 {
+        violations.push(format!(
+            "Binance reference table has {duplicate_count} duplicate primary/symbol-close row(s): {}",
+            duplicate_examples.join("; ")
+        ));
+    }
+
+    for (symbol, (start_ns, end_ns)) in required_reference_ranges(&market_rows)? {
+        let first_close = ceil_to_second(start_ns).max(SECOND_NS);
+        let last_close = floor_to_second(end_ns);
+        if first_close > last_close {
+            continue;
+        }
+        let Some(available) = closes_by_symbol.get(&symbol) else {
+            violations.push(format!(
+                "Binance reference coverage missing all rows for {symbol} over {}..{}",
+                first_close, last_close
+            ));
+            continue;
+        };
+
+        let mut missing_count = 0usize;
+        let mut examples = Vec::new();
+        let mut ts = first_close;
+        while ts <= last_close {
+            if !available.contains(&ts) {
+                missing_count += 1;
+                if examples.len() < 8 {
+                    examples.push(ts.to_string());
+                }
+            }
+            ts = ts.saturating_add(SECOND_NS);
+            if ts == i64::MAX {
+                break;
+            }
+        }
+        if missing_count > 0 {
+            violations.push(format!(
+                "Binance reference coverage missing {missing_count} 1s bar(s) for {symbol} over {}..{}; examples {}",
+                first_close,
+                last_close,
+                examples.join(",")
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        bail!("Binance reference fail-closed: {}", violations.join("; "));
+    }
+    Ok(())
+}
+
+fn required_reference_ranges(market_rows: &[MarketDimRow]) -> Result<BTreeMap<String, (i64, i64)>> {
+    let mut ranges = BTreeMap::<String, (i64, i64)>::new();
+    for row in market_rows {
+        let symbol = reference_symbol_for_market(&row.symbol)
+            .ok_or_else(|| anyhow!("unsupported market symbol '{}'", row.symbol))?;
+        let start = row
+            .window_start_ts_ns
+            .saturating_sub(REFERENCE_LOOKBACK_NS)
+            .max(0);
+        let end = row.window_end_ts_ns;
+        ranges
+            .entry(symbol)
+            .and_modify(|(min_start, max_end)| {
+                *min_start = (*min_start).min(start);
+                *max_end = (*max_end).max(end);
+            })
+            .or_insert((start, end));
+    }
+    Ok(ranges)
+}
+
+fn reference_symbol_for_market(symbol: &str) -> Option<String> {
+    let upper = symbol.trim().to_ascii_uppercase();
+    let asset = upper
+        .split_once('-')
+        .map(|(asset, _)| asset)
+        .unwrap_or(upper.as_str());
+    if asset.is_empty() || !asset.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        None
+    } else if asset.ends_with("USDT") {
+        Some(asset.to_string())
+    } else {
+        Some(format!("{asset}USDT"))
+    }
+}
+
+fn normalize_reference_symbol(symbol: &str) -> String {
+    let upper = symbol.trim().to_ascii_uppercase();
+    if upper.ends_with("USDT") {
+        upper
+    } else {
+        reference_symbol_for_market(&upper).unwrap_or(upper)
+    }
+}
+
+fn ceil_to_second(ts_ns: i64) -> i64 {
+    if ts_ns <= 0 {
+        0
+    } else {
+        ((ts_ns + SECOND_NS - 1) / SECOND_NS) * SECOND_NS
+    }
+}
+
+fn floor_to_second(ts_ns: i64) -> i64 {
+    ts_ns.div_euclid(SECOND_NS) * SECOND_NS
 }
 
 fn validate_market_condition_contract(plan: &PipelinePlan) -> Result<()> {
