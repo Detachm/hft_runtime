@@ -1162,7 +1162,7 @@ async fn send_state(tx: &mpsc::Sender<WsWriterCommand>, patch: WsStatePatch) -> 
         .map_err(|_| anyhow!("WS writer channel closed"))
 }
 
-async fn connect_ws_endpoint(
+pub(crate) async fn connect_ws_endpoint(
     endpoint: &str,
 ) -> Result<(
     WebSocketStream<MaybeTlsStream<TcpStream>>,

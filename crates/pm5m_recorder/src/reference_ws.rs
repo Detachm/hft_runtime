@@ -3,6 +3,7 @@ use crate::util::{
     append_recorder_health, command_line, current_binary_sha256, current_git_sha, current_host,
     last_recv_age_ms,
 };
+use crate::ws::connect_ws_endpoint;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_data_etl_core::{
@@ -14,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 pub const DEFAULT_REFERENCE_WS_CHANNEL_CAPACITY: usize = 8_192;
 pub const DEFAULT_REFERENCE_WS_FLUSH_INTERVAL_MS: u64 = 5_000;
@@ -140,8 +141,8 @@ async fn binance_reference_loop(
     let url = format!("{}?streams={streams}", options.binance_ws_url);
     let mut overrun = ReferenceOverrunTracker::default();
     loop {
-        match connect_async(&url).await {
-            Ok((mut ws, _)) => {
+        match tokio::time::timeout(Duration::from_secs(15), connect_ws_endpoint(&url)).await {
+            Ok(Ok((mut ws, _))) => {
                 let _ = send_control(
                     &tx,
                     "binance",
@@ -242,7 +243,7 @@ async fn binance_reference_loop(
                     .await;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let _ = tx
                     .send(ReferenceWriterCommand::Error(format!(
                         "binance connect error: {error}"
@@ -264,6 +265,31 @@ async fn binance_reference_loop(
                     None,
                     "coverage_gap_start",
                     json!({"reason": "connect_error", "error": error.to_string()}),
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(ReferenceWriterCommand::Error(format!(
+                        "binance connect timeout: {error}"
+                    )))
+                    .await;
+                let _ = send_control(
+                    &tx,
+                    "binance",
+                    "disconnect",
+                    None,
+                    "connect_timeout",
+                    json!({"error": error.to_string(), "url": &url}),
+                )
+                .await;
+                let _ = send_control(
+                    &tx,
+                    "binance",
+                    "gap_suspected",
+                    None,
+                    "coverage_gap_start",
+                    json!({"reason": "connect_timeout", "error": error.to_string()}),
                 )
                 .await;
             }
@@ -293,8 +319,13 @@ async fn okx_reference_loop(
     let subscribe = json!({"op": "subscribe", "args": args}).to_string();
     let mut overrun = ReferenceOverrunTracker::default();
     loop {
-        match connect_async(&options.okx_ws_url).await {
-            Ok((mut ws, _)) => {
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            connect_ws_endpoint(&options.okx_ws_url),
+        )
+        .await
+        {
+            Ok(Ok((mut ws, _))) => {
                 let _ = send_control(
                     &tx,
                     "okx",
@@ -410,7 +441,7 @@ async fn okx_reference_loop(
                     .await;
                 }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 let _ = tx
                     .send(ReferenceWriterCommand::Error(format!(
                         "okx connect error: {error}"
@@ -432,6 +463,31 @@ async fn okx_reference_loop(
                     None,
                     "coverage_gap_start",
                     json!({"reason": "connect_error", "error": error.to_string()}),
+                )
+                .await;
+            }
+            Err(error) => {
+                let _ = tx
+                    .send(ReferenceWriterCommand::Error(format!(
+                        "okx connect timeout: {error}"
+                    )))
+                    .await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "disconnect",
+                    None,
+                    "connect_timeout",
+                    json!({"error": error.to_string(), "url": &options.okx_ws_url}),
+                )
+                .await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "gap_suspected",
+                    None,
+                    "coverage_gap_start",
+                    json!({"reason": "connect_timeout", "error": error.to_string()}),
                 )
                 .await;
             }
