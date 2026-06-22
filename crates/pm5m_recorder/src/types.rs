@@ -273,6 +273,10 @@ pub struct WsRecorderState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_recv_ts_ns: Option<i64>,
+    #[serde(default)]
+    pub local_overrun_count: u64,
+    #[serde(default)]
+    pub local_overrun_last_ts_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -293,6 +297,10 @@ pub struct ReferenceWsRecorderState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_recv_ts_ns: Option<i64>,
+    #[serde(default)]
+    pub local_overrun_count: u64,
+    #[serde(default)]
+    pub local_overrun_last_ts_ns: Option<i64>,
 }
 
 impl Default for ReferenceWsRecorderState {
@@ -306,6 +314,8 @@ impl Default for ReferenceWsRecorderState {
             last_segment_hash: None,
             last_error: None,
             last_recv_ts_ns: None,
+            local_overrun_count: 0,
+            local_overrun_last_ts_ns: None,
         }
     }
 }
@@ -327,6 +337,8 @@ impl Default for WsRecorderState {
             last_segment_hash: None,
             last_error: None,
             last_recv_ts_ns: None,
+            local_overrun_count: 0,
+            local_overrun_last_ts_ns: None,
         }
     }
 }
@@ -409,7 +421,36 @@ pub struct RecorderRunManifest {
     pub state_root: PathBuf,
     pub audit_profile_hash: Option<String>,
     pub config_hash: Option<String>,
+    #[serde(default)]
+    pub git_sha: Option<String>,
+    #[serde(default)]
+    pub binary_sha256: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub command_line: Vec<String>,
+    #[serde(default)]
+    pub alignment_policy: Option<RecorderAlignmentPolicy>,
     pub outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecorderAlignmentPolicy {
+    pub poly_price_change_latency_ms: u64,
+    pub poly_snapshot_policy: String,
+    pub binance_reference_latency_ms: u64,
+    pub reference_bar_policy: String,
+}
+
+impl RecorderAlignmentPolicy {
+    pub fn live_replay_default() -> Self {
+        Self {
+            poly_price_change_latency_ms: 20,
+            poly_snapshot_policy: "local_receive_time".to_string(),
+            binance_reference_latency_ms: 200,
+            reference_bar_policy: "exchange_event_time_plus_latency".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -452,6 +493,14 @@ pub struct RecorderHealthEvent {
     pub current_asset_count: Option<u64>,
     pub last_recv_ts_ns: Option<i64>,
     pub last_recv_age_ms: Option<i64>,
+    #[serde(default)]
+    pub queue_depth: Option<u64>,
+    #[serde(default)]
+    pub writer_buffer_rows: Option<u64>,
+    #[serde(default)]
+    pub local_overrun_count: Option<u64>,
+    #[serde(default)]
+    pub local_overrun_last_ts_ns: Option<i64>,
     pub error: Option<String>,
 }
 

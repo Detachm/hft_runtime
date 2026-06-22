@@ -50,11 +50,11 @@ fi
 
 mapfile -t script_files < <(find scripts -type f -name '*.sh' ! -path 'scripts/private/perf_gate_pm5m.sh' | sort)
 if [[ "${#script_files[@]}" -gt 0 ]] && rg -n 'pm5m-recorder -- run([[:space:]]|$)| run --config' "${script_files[@]}"; then
-  echo "recorder scripts must use pm5m-recorder run-dual" >&2
+  echo "recorder scripts must use explicit WS subcommands, not retired HTTP recorder commands" >&2
   exit 2
 fi
-if [[ "${#script_files[@]}" -gt 0 ]] && rg -n 'pm5m-recorder.*run-ws|-- run-ws([[:space:]]|$)' "${script_files[@]}"; then
-  echo "recorder scripts must use pm5m-recorder run-dual" >&2
+if [[ "${#script_files[@]}" -gt 0 ]] && rg -n 'pm5m-recorder.*run-dual|-- run-dual([[:space:]]|$)' "${script_files[@]}"; then
+  echo "recorder scripts must split Poly and reference recording; run-dual is retired for production" >&2
   exit 2
 fi
 

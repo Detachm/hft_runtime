@@ -11,13 +11,15 @@ reference and settlement caches.
 ## Active Flow
 
 ```text
-pm5m-recorder run-dual
-  writes Polymarket CLOB HFTREC4 raw WS audit
-  appends HFTBOOK2 live book_state cache
-  records Binance 1s reference events and audit_profile.json
+pm5m-recorder run-ws
+  runs one Polymarket CLOB HFTREC4 raw recorder per active symbol
+  records BTC/ETH/SOL 5m/15m with structured coverage control rows
+
+pm5m-recorder run-reference-ws
+  records Binance BTC/ETH/SOL 1s reference events and audit_profile.json
 
 pm5m-market-cache
-  builds/validates HFTBOOK2 from HFTREC4
+  builds/validates HFTBOOK2 from HFTREC4 offline
   builds/validates HFTIDX1 from HFTBOOK2
   builds/validates HFTREF1 and HFTSETTLE1
 
@@ -40,7 +42,8 @@ Do not use or recreate these for PM5M production or research:
 
 ## Minimum Research Loop
 
-1. Make sure the recorder is writing HFTREC4 raw and HFTBOOK2 live cache.
+1. Make sure the four recorder roles are writing HFTREC4 raw: `poly_btc`, `poly_eth`,
+   `poly_sol`, and `reference_binance`.
 2. For live-like research, apply `docs/pm5m_poly_server_time_alignment.md` before building
    HFTBOOK2/HFTREF1.
 3. Build or refresh HFTIDX1 from the HFTBOOK2 root.
@@ -52,15 +55,13 @@ Do not use or recreate these for PM5M production or research:
 
 ## Canonical Commands
 
-Dual recorder:
+Production recorders:
 
 ```sh
-ROOT_DIR=/home/hliu/hft_runtime \
-CONFIG=/home/hliu/hft_runtime/configs/pm5m-recorder-hftrec4.example.json \
-RAW_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/raw \
-STATE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/state \
-BOOK_STATE_CACHE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/book_hftbook2 \
-scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_btc scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_eth scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_sol scripts/run_pm5m_recorder_supervised.sh
+ROLE=reference_binance scripts/run_pm5m_recorder_supervised.sh
 ```
 
 Backtest, current ETH gray live-aligned config, when the local private `hft_private/` checkout

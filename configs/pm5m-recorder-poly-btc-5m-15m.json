@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "dataset_format": "pm5m_recorder_config.v1",
-  "raw_root": "/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/raw",
-  "state_root": "/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/state",
+  "raw_root": "/mnt/data/hft/hft_runtime/pm5m_recorder_prod/poly_btc_5m_15m/raw",
+  "state_root": "/mnt/data/hft/hft_runtime/pm5m_recorder_prod/poly_btc_5m_15m/state",
   "poll_interval_ms": 1000,
   "discovery_interval_cycles": 60,
-  "max_assets_per_cycle": 24,
+  "max_assets_per_cycle": 32,
   "top_n": 10,
   "http_timeout_ms": 5000,
   "http_max_retries": 2,
@@ -15,21 +15,14 @@
     "gamma_markets_url": "https://gamma-api.polymarket.com/markets",
     "discovery": {
       "enabled": true,
-      "limit": 200,
+      "limit": 80,
       "order": "volume24hr",
       "ascending": false,
       "require_accepting_orders": true,
       "require_order_book": true,
       "question_or_slug_contains_any": [],
-      "pm5m_symbols": [
-        "BTC",
-        "ETH",
-        "SOL"
-      ],
-      "pm5m_intervals": [
-        "5m",
-        "15m"
-      ],
+      "pm5m_symbols": ["BTC"],
+      "pm5m_intervals": ["5m", "15m"],
       "pm5m_past_window_count": 1,
       "pm5m_future_window_count": 5
     },

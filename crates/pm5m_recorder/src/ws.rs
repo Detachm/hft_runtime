@@ -2,7 +2,10 @@ use crate::discovery::discover_assets;
 use crate::http::BlockingHttpFetcher;
 use crate::state::validate_config;
 use crate::types::*;
-use crate::util::{append_recorder_health, last_recv_age_ms, string_field};
+use crate::util::{
+    append_recorder_health, command_line, current_binary_sha256, current_git_sha, current_host,
+    last_recv_age_ms, string_field,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_data_etl_core::{
@@ -16,13 +19,15 @@ use pm5m_market_cache::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{
     client_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream,
@@ -210,6 +215,50 @@ enum WsStatePatch {
     LastError(Option<String>),
 }
 
+#[derive(Debug, Default)]
+struct LocalOverrunTracker {
+    pending_count: u64,
+    pending_first_ts_ns: Option<i64>,
+    pending_last_ts_ns: Option<i64>,
+    total_count: u64,
+    last_queue_depth: u64,
+}
+
+impl LocalOverrunTracker {
+    fn record_drop(&mut self, local_ts_ns: i64, queue_depth: u64) {
+        if self.pending_count == 0 {
+            self.pending_first_ts_ns = Some(local_ts_ns);
+        }
+        self.pending_count = self.pending_count.saturating_add(1);
+        self.pending_last_ts_ns = Some(local_ts_ns);
+        self.total_count = self.total_count.saturating_add(1);
+        self.last_queue_depth = queue_depth;
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_count = 0;
+        self.pending_first_ts_ns = None;
+        self.pending_last_ts_ns = None;
+    }
+}
+
+#[derive(Debug)]
+struct WsConnectionFailure {
+    operation: &'static str,
+    category: &'static str,
+    message: String,
+    close_code: Option<u16>,
+    close_reason: Option<String>,
+}
+
+impl fmt::Display for WsConnectionFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl StdError for WsConnectionFailure {}
+
 pub async fn run_ws_forever(config: RecorderConfig, options: WsRecorderOptions) -> Result<()> {
     validate_ws_inputs(&config, &options)?;
     fs::create_dir_all(&options.raw_root)
@@ -267,7 +316,14 @@ pub async fn run_ws_forever(config: RecorderConfig, options: WsRecorderOptions) 
             &tx,
             ctx.control_row(
                 "disconnect",
-                message.as_bytes().to_vec(),
+                ws_error_control_payload(
+                    "disconnect",
+                    "connection_end",
+                    &state,
+                    &options,
+                    &err,
+                    ws_queue_depth(&tx),
+                )?,
                 now_unix_ns() as i64,
             )?,
         )
@@ -276,7 +332,14 @@ pub async fn run_ws_forever(config: RecorderConfig, options: WsRecorderOptions) 
             &tx,
             ctx.control_row(
                 "gap_suspected",
-                message.as_bytes().to_vec(),
+                ws_error_control_payload(
+                    "gap_suspected",
+                    "coverage_gap_start",
+                    &state,
+                    &options,
+                    &err,
+                    ws_queue_depth(&tx),
+                )?,
                 now_unix_ns() as i64,
             )?,
         )
@@ -292,8 +355,18 @@ pub async fn run_ws_forever(config: RecorderConfig, options: WsRecorderOptions) 
         let sleep_for = backoffs[backoff_idx.min(backoffs.len() - 1)];
         backoff_idx = (backoff_idx + 1).min(backoffs.len() - 1);
         tokio::time::sleep(sleep_for).await;
-        let reconnect_row =
-            ctx.control_row("reconnect", b"reconnect".to_vec(), now_unix_ns() as i64)?;
+        let reconnect_row = ctx.control_row(
+            "reconnect",
+            ws_control_payload(
+                "reconnect",
+                "reconnect_after_backoff",
+                &state,
+                &options,
+                ws_queue_depth(&tx),
+                json!({"sleep_ms": sleep_for.as_millis()}),
+            )?,
+            now_unix_ns() as i64,
+        )?;
         state.next_ingest_seq = ctx.next_ingest_seq;
         send_row(&tx, reconnect_row).await?;
     }
@@ -335,11 +408,19 @@ async fn run_ws_connection(
         state.next_ingest_seq,
         &state.current_assets,
     );
+    let mut overrun = LocalOverrunTracker::default();
     send_row(
         tx,
         ctx.control_row(
             "connect",
-            options.endpoint.as_bytes().to_vec(),
+            ws_control_payload(
+                "connect",
+                "connect",
+                state,
+                options,
+                ws_queue_depth(tx),
+                json!({"endpoint": options.endpoint}),
+            )?,
             now_unix_ns() as i64,
         )?,
     )
@@ -352,7 +433,22 @@ async fn run_ws_connection(
         .context("send WS subscription")?;
     send_row(
         tx,
-        ctx.control_row("subscribe", subscription.into_bytes(), now_unix_ns() as i64)?,
+        ctx.control_row(
+            "subscribe",
+            ws_control_payload(
+                "subscribe",
+                "initial_subscribe",
+                state,
+                options,
+                ws_queue_depth(tx),
+                json!({
+                    "asset_count": state.current_assets.len(),
+                    "payload_sha256": sha256_bytes(subscription.as_bytes()),
+                    "payload": subscription,
+                }),
+            )?,
+            now_unix_ns() as i64,
+        )?,
     )
     .await?;
     state.next_ingest_seq = ctx.next_ingest_seq;
@@ -369,10 +465,10 @@ async fn run_ws_connection(
                 write.send(Message::Text("PING".to_string())).await.context("send WS PING")?;
                 let row = ctx.control_row("ping", b"PING".to_vec(), now_unix_ns() as i64)?;
                 state.next_ingest_seq = ctx.next_ingest_seq;
-                send_row(tx, row).await?;
+                enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
             }
             _ = rediscovery.tick() => {
-                refresh_ws_subscription(config, tx, &mut write, state, &mut ctx).await?;
+                refresh_ws_subscription(config, options, tx, &mut write, state, &mut ctx).await?;
             }
             message = read.next() => {
                 let Some(message) = message else {
@@ -386,13 +482,13 @@ async fn run_ws_connection(
                         state.next_ingest_seq = ctx.next_ingest_seq;
                         state.last_recv_ts_ns = Some(recv_ts);
                         for row in rows {
-                            send_row(tx, row).await?;
+                            enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
                         }
                         if is_ping {
                             write.send(Message::Text("PONG".to_string())).await.context("send text PONG")?;
                             let row = ctx.control_row("pong", b"PONG".to_vec(), now_unix_ns() as i64)?;
                             state.next_ingest_seq = ctx.next_ingest_seq;
-                            send_row(tx, row).await?;
+                            enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
                         }
                     }
                     Message::Binary(bytes) => {
@@ -406,7 +502,7 @@ async fn run_ws_connection(
                         state.next_ingest_seq = ctx.next_ingest_seq;
                         state.last_recv_ts_ns = Some(recv_ts);
                         for row in rows {
-                            send_row(tx, row).await?;
+                            enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
                         }
                     }
                     Message::Ping(bytes) => {
@@ -415,17 +511,17 @@ async fn run_ws_connection(
                         let row = ctx.control_row("ping", bytes, recv_ts)?;
                         state.next_ingest_seq = ctx.next_ingest_seq;
                         state.last_recv_ts_ns = Some(recv_ts);
-                        send_row(tx, row).await?;
+                        enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
                     }
                     Message::Pong(bytes) => {
                         let recv_ts = now_unix_ns() as i64;
                         let row = ctx.control_row("pong", bytes, recv_ts)?;
                         state.next_ingest_seq = ctx.next_ingest_seq;
                         state.last_recv_ts_ns = Some(recv_ts);
-                        send_row(tx, row).await?;
+                        enqueue_ws_row_nonblocking(tx, row, &mut ctx, state, options, &mut overrun)?;
                     }
                     Message::Close(frame) => {
-                        bail!("websocket closed: {frame:?}");
+                        return Err(anyhow!(ws_close_failure(frame)));
                     }
                     Message::Frame(_) => {}
                 }
@@ -436,6 +532,7 @@ async fn run_ws_connection(
 
 async fn refresh_ws_subscription<S>(
     config: &RecorderConfig,
+    options: &WsRecorderOptions,
     tx: &mpsc::Sender<WsWriterCommand>,
     write: &mut S,
     state: &mut WsRecorderState,
@@ -469,7 +566,23 @@ where
             .send(Message::Text(payload.clone()))
             .await
             .context("send WS dynamic subscribe")?;
-        let row = ctx.control_row("subscribe", payload.into_bytes(), now_unix_ns() as i64)?;
+        let row = ctx.control_row(
+            "subscribe",
+            ws_control_payload(
+                "subscribe",
+                "dynamic_subscribe",
+                state,
+                options,
+                ws_queue_depth(tx),
+                json!({
+                    "asset_count": state.current_assets.len(),
+                    "added_count": added.len(),
+                    "payload_sha256": sha256_bytes(payload.as_bytes()),
+                    "payload": payload,
+                }),
+            )?,
+            now_unix_ns() as i64,
+        )?;
         state.next_ingest_seq = ctx.next_ingest_seq;
         send_row(tx, row).await?;
     }
@@ -479,7 +592,23 @@ where
             .send(Message::Text(payload.clone()))
             .await
             .context("send WS dynamic unsubscribe")?;
-        let row = ctx.control_row("unsubscribe", payload.into_bytes(), now_unix_ns() as i64)?;
+        let row = ctx.control_row(
+            "unsubscribe",
+            ws_control_payload(
+                "unsubscribe",
+                "dynamic_unsubscribe",
+                state,
+                options,
+                ws_queue_depth(tx),
+                json!({
+                    "asset_count": state.current_assets.len(),
+                    "removed_count": removed.len(),
+                    "payload_sha256": sha256_bytes(payload.as_bytes()),
+                    "payload": payload,
+                }),
+            )?,
+            now_unix_ns() as i64,
+        )?;
         state.next_ingest_seq = ctx.next_ingest_seq;
         send_row(tx, row).await?;
     }
@@ -516,6 +645,7 @@ async fn ws_writer_loop(
             maybe_command = rx.recv() => {
                 match maybe_command {
                     Some(WsWriterCommand::Row(row)) => {
+                        apply_ws_local_overrun_row(&mut state, &row);
                         payload_bytes = payload_bytes.saturating_add(row.raw_payload.len());
                         pending_next_ingest_seq =
                             pending_next_ingest_seq.max(row.ingest_seq.saturating_add(1));
@@ -529,6 +659,7 @@ async fn ws_writer_loop(
                                 &mut payload_bytes,
                                 &mut pending_next_ingest_seq,
                                 &mut segment_started_at,
+                                rx.len() as u64,
                                 book_replayer.as_mut(),
                             )?;
                         }
@@ -559,6 +690,8 @@ async fn ws_writer_loop(
                                     rows.len() as u64,
                                     payload_bytes as u64,
                                     None,
+                                    rx.len() as u64,
+                                    rows.len() as u64,
                                     patch_error,
                                 )?;
                             }
@@ -575,6 +708,7 @@ async fn ws_writer_loop(
                         &mut payload_bytes,
                         &mut pending_next_ingest_seq,
                         &mut segment_started_at,
+                        rx.len() as u64,
                             book_replayer.as_mut(),
                         )?;
                     } else {
@@ -585,6 +719,8 @@ async fn ws_writer_loop(
                             rows.len() as u64,
                             payload_bytes as u64,
                             None,
+                            rx.len() as u64,
+                            rows.len() as u64,
                             None,
                         )?;
                     }
@@ -598,6 +734,7 @@ async fn ws_writer_loop(
         &mut payload_bytes,
         &mut pending_next_ingest_seq,
         &mut segment_started_at,
+        rx.len() as u64,
         book_replayer.as_mut(),
     )?;
     Ok(())
@@ -610,6 +747,7 @@ fn flush_ws_rows(
     payload_bytes: &mut usize,
     pending_next_ingest_seq: &mut u64,
     segment_started_at: &mut Instant,
+    queue_depth: u64,
     book_replayer: Option<&mut CanonicalWsBookReplayer>,
 ) -> Result<()> {
     if rows.is_empty() {
@@ -677,6 +815,8 @@ fn flush_ws_rows(
         row_count as u64,
         bytes as u64,
         Some(elapsed_ms as u64),
+        queue_depth,
+        row_count as u64,
         None,
     )?;
     rows.clear();
@@ -692,6 +832,8 @@ fn append_ws_health(
     rows: u64,
     payload_bytes: u64,
     flush_elapsed_ms: Option<u64>,
+    queue_depth: u64,
+    writer_buffer_rows: u64,
     error: Option<String>,
 ) -> Result<()> {
     let now_ns = now_unix_ns() as i64;
@@ -721,6 +863,10 @@ fn append_ws_health(
             current_asset_count: Some(state.current_assets.len() as u64),
             last_recv_ts_ns: state.last_recv_ts_ns,
             last_recv_age_ms: last_recv_age_ms(now_ns, state.last_recv_ts_ns),
+            queue_depth: Some(queue_depth),
+            writer_buffer_rows: Some(writer_buffer_rows),
+            local_overrun_count: Some(state.local_overrun_count),
+            local_overrun_last_ts_ns: state.local_overrun_last_ts_ns,
             error: error.or_else(|| state.last_error.clone()),
         },
     )
@@ -817,6 +963,191 @@ async fn discover_ws_assets(
     })
     .await
     .context("join WS discovery task")?
+}
+
+fn enqueue_ws_row_nonblocking(
+    tx: &mpsc::Sender<WsWriterCommand>,
+    row: RawPolymarketClobWsEvent,
+    ctx: &mut WsRowContext,
+    state: &mut WsRecorderState,
+    options: &WsRecorderOptions,
+    overrun: &mut LocalOverrunTracker,
+) -> Result<()> {
+    try_flush_ws_overrun_marker(tx, ctx, state, options, overrun)?;
+    state.next_ingest_seq = ctx.next_ingest_seq;
+    match tx.try_send(WsWriterCommand::Row(row)) {
+        Ok(()) => {
+            state.next_ingest_seq = ctx.next_ingest_seq;
+            Ok(())
+        }
+        Err(TrySendError::Full(WsWriterCommand::Row(row))) => {
+            overrun.record_drop(row.local_recv_ts_ns, ws_queue_depth(tx));
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => {
+            overrun.record_drop(now_unix_ns() as i64, ws_queue_depth(tx));
+            Ok(())
+        }
+        Err(TrySendError::Closed(_)) => Err(anyhow!("WS writer channel closed")),
+    }
+}
+
+fn try_flush_ws_overrun_marker(
+    tx: &mpsc::Sender<WsWriterCommand>,
+    ctx: &mut WsRowContext,
+    state: &WsRecorderState,
+    options: &WsRecorderOptions,
+    overrun: &mut LocalOverrunTracker,
+) -> Result<()> {
+    if overrun.pending_count == 0 || tx.capacity() == 0 {
+        return Ok(());
+    }
+    let payload = ws_control_payload(
+        "local_overrun",
+        "reader_queue_full",
+        state,
+        options,
+        ws_queue_depth(tx),
+        json!({
+            "dropped_row_count": overrun.pending_count,
+            "pending_first_ts_ns": overrun.pending_first_ts_ns,
+            "pending_last_ts_ns": overrun.pending_last_ts_ns,
+            "total_dropped_row_count": overrun.total_count,
+            "last_queue_depth": overrun.last_queue_depth,
+        }),
+    )?;
+    let row = ctx.control_row("local_overrun", payload, now_unix_ns() as i64)?;
+    match tx.try_send(WsWriterCommand::Row(row)) {
+        Ok(()) => {
+            overrun.clear_pending();
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Closed(_)) => Err(anyhow!("WS writer channel closed")),
+    }
+}
+
+fn ws_queue_depth(tx: &mpsc::Sender<WsWriterCommand>) -> u64 {
+    tx.max_capacity().saturating_sub(tx.capacity()) as u64
+}
+
+fn ws_control_payload(
+    event_type: &str,
+    operation: &str,
+    state: &WsRecorderState,
+    options: &WsRecorderOptions,
+    queue_depth: u64,
+    details: Value,
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "event_type": event_type,
+        "operation": operation,
+        "component": "polymarket_clob_ws",
+        "endpoint": options.endpoint,
+        "connection_id": state.connection_id,
+        "subscription_epoch": state.subscription_epoch,
+        "asset_count": state.current_assets.len(),
+        "last_recv_age_ms": last_recv_age_ms(now_unix_ns() as i64, state.last_recv_ts_ns),
+        "queue_depth": queue_depth,
+        "channel_capacity": options.channel_capacity,
+        "details": details,
+    }))?)
+}
+
+fn ws_error_control_payload(
+    event_type: &str,
+    operation: &str,
+    state: &WsRecorderState,
+    options: &WsRecorderOptions,
+    err: &anyhow::Error,
+    queue_depth: u64,
+) -> Result<Vec<u8>> {
+    let message = err.to_string();
+    let failure = err.downcast_ref::<WsConnectionFailure>();
+    let io_error_kind = err
+        .downcast_ref::<std::io::Error>()
+        .map(|error| format!("{:?}", error.kind()));
+    ws_control_payload(
+        event_type,
+        operation,
+        state,
+        options,
+        queue_depth,
+        json!({
+            "error": message,
+            "error_chain": format!("{err:?}"),
+            "operation": failure.map(|failure| failure.operation).unwrap_or_else(|| classify_ws_error_operation(&message)),
+            "category": failure.map(|failure| failure.category).unwrap_or_else(|| classify_ws_error_category(&message)),
+            "close_code": failure.and_then(|failure| failure.close_code),
+            "close_reason": failure.and_then(|failure| failure.close_reason.clone()),
+            "io_error_kind": io_error_kind,
+        }),
+    )
+}
+
+fn classify_ws_error_operation(message: &str) -> &'static str {
+    if message.contains("PING") || message.contains("pong") || message.contains("PONG") {
+        "ping_write"
+    } else if message.contains("dynamic subscribe") || message.contains("subscription") {
+        "subscribe"
+    } else if message.contains("dynamic unsubscribe") {
+        "unsubscribe"
+    } else if message.contains("connect") {
+        "connect"
+    } else if message.contains("read WS message") || message.contains("stream ended") {
+        "read"
+    } else {
+        "unknown"
+    }
+}
+
+fn classify_ws_error_category(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("closed") || lower.contains("stream ended") {
+        "closed"
+    } else if lower.contains("tls") {
+        "tls"
+    } else if lower.contains("protocol") {
+        "protocol"
+    } else if lower.contains("io") || lower.contains("connection reset") {
+        "io"
+    } else {
+        "unknown"
+    }
+}
+
+fn ws_close_failure(
+    frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame<'static>>,
+) -> WsConnectionFailure {
+    let close_code = frame.as_ref().map(|frame| u16::from(frame.code));
+    let close_reason = frame.as_ref().map(|frame| frame.reason.to_string());
+    WsConnectionFailure {
+        operation: "read",
+        category: "closed",
+        message: format!("websocket closed: {frame:?}"),
+        close_code,
+        close_reason,
+    }
+}
+
+fn apply_ws_local_overrun_row(state: &mut WsRecorderState, row: &RawPolymarketClobWsEvent) {
+    if row.event_type != "local_overrun" {
+        return;
+    }
+    let dropped = serde_json::from_slice::<Value>(&row.raw_payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("details")
+                .and_then(|details| details.get("dropped_row_count"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(1);
+    state.local_overrun_count = state.local_overrun_count.saturating_add(dropped);
+    state.local_overrun_last_ts_ns = Some(row.local_recv_ts_ns);
 }
 
 async fn send_row(tx: &mpsc::Sender<WsWriterCommand>, row: RawPolymarketClobWsEvent) -> Result<()> {
@@ -1149,6 +1480,11 @@ fn write_ws_run_manifest(config: &RecorderConfig, options: &WsRecorderOptions) -
             "flush_bytes": options.flush_policy.max_payload_bytes,
             "flush_rows": options.flush_policy.max_rows,
         }))?),
+        git_sha: current_git_sha(),
+        binary_sha256: current_binary_sha256(),
+        host: current_host(),
+        command_line: command_line(),
+        alignment_policy: Some(RecorderAlignmentPolicy::live_replay_default()),
         outputs: vec![
             "recorder_state.json".to_string(),
             RECORDER_HEALTH_STREAM.to_string(),

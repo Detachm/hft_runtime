@@ -1,5 +1,8 @@
 use crate::types::*;
-use crate::util::{append_recorder_health, last_recv_age_ms};
+use crate::util::{
+    append_recorder_health, command_line, current_binary_sha256, current_git_sha, current_host,
+    last_recv_age_ms,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use market_data_etl_core::{
@@ -10,7 +13,7 @@ use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub const DEFAULT_REFERENCE_WS_CHANNEL_CAPACITY: usize = 8_192;
@@ -54,6 +57,33 @@ impl ReferenceWsFlushPolicy {
 enum ReferenceWriterCommand {
     Row(RawReferenceWsEvent),
     Error(String),
+}
+
+#[derive(Debug, Default)]
+struct ReferenceOverrunTracker {
+    pending_count: u64,
+    pending_first_ts_ns: Option<i64>,
+    pending_last_ts_ns: Option<i64>,
+    total_count: u64,
+    last_queue_depth: u64,
+}
+
+impl ReferenceOverrunTracker {
+    fn record_drop(&mut self, local_ts_ns: i64, queue_depth: u64) {
+        if self.pending_count == 0 {
+            self.pending_first_ts_ns = Some(local_ts_ns);
+        }
+        self.pending_count = self.pending_count.saturating_add(1);
+        self.pending_last_ts_ns = Some(local_ts_ns);
+        self.total_count = self.total_count.saturating_add(1);
+        self.last_queue_depth = queue_depth;
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_count = 0;
+        self.pending_first_ts_ns = None;
+        self.pending_last_ts_ns = None;
+    }
 }
 
 pub async fn run_reference_ws_forever(options: ReferenceWsRecorderOptions) -> Result<()> {
@@ -108,18 +138,32 @@ async fn binance_reference_loop(
         .collect::<Vec<_>>()
         .join("/");
     let url = format!("{}?streams={streams}", options.binance_ws_url);
+    let mut overrun = ReferenceOverrunTracker::default();
     loop {
         match connect_async(&url).await {
             Ok((mut ws, _)) => {
-                let _ = send_control(&tx, "binance", "connect", None, &url).await;
+                let _ = send_control(
+                    &tx,
+                    "binance",
+                    "connect",
+                    None,
+                    "connect",
+                    json!({"url": &url, "streams": &streams}),
+                )
+                .await;
+                let mut wrote_gap_control = false;
                 while let Some(message) = ws.next().await {
                     let local_recv_ts_ns = now_unix_ns() as i64;
                     match message {
                         Ok(Message::Text(text)) => {
                             for row in binance_rows_from_text(&text, local_recv_ts_ns)? {
-                                tx.send(ReferenceWriterCommand::Row(row))
-                                    .await
-                                    .map_err(|_| anyhow!("reference writer channel closed"))?;
+                                enqueue_reference_row_nonblocking(
+                                    &tx,
+                                    row,
+                                    &mut overrun,
+                                    "binance",
+                                    None,
+                                )?;
                             }
                         }
                         Ok(Message::Ping(bytes)) => {
@@ -131,9 +175,20 @@ async fn binance_reference_loop(
                                 "binance",
                                 "disconnect",
                                 None,
-                                &format!("{frame:?}"),
+                                "close_frame",
+                                json!({"close_frame": format!("{frame:?}")}),
                             )
                             .await;
+                            let _ = send_control(
+                                &tx,
+                                "binance",
+                                "gap_suspected",
+                                None,
+                                "coverage_gap_start",
+                                json!({"reason": "close_frame", "close_frame": format!("{frame:?}")}),
+                            )
+                            .await;
+                            wrote_gap_control = true;
                             break;
                         }
                         Ok(_) => {}
@@ -143,9 +198,48 @@ async fn binance_reference_loop(
                                     "binance ws error: {error}"
                                 )))
                                 .await;
+                            let _ = send_control(
+                                &tx,
+                                "binance",
+                                "disconnect",
+                                None,
+                                "ws_error",
+                                json!({"error": error.to_string()}),
+                            )
+                            .await;
+                            let _ = send_control(
+                                &tx,
+                                "binance",
+                                "gap_suspected",
+                                None,
+                                "coverage_gap_start",
+                                json!({"reason": "ws_error", "error": error.to_string()}),
+                            )
+                            .await;
+                            wrote_gap_control = true;
                             break;
                         }
                     }
+                }
+                if !wrote_gap_control {
+                    let _ = send_control(
+                        &tx,
+                        "binance",
+                        "disconnect",
+                        None,
+                        "stream_ended",
+                        json!({"reason": "stream_ended"}),
+                    )
+                    .await;
+                    let _ = send_control(
+                        &tx,
+                        "binance",
+                        "gap_suspected",
+                        None,
+                        "coverage_gap_start",
+                        json!({"reason": "stream_ended"}),
+                    )
+                    .await;
                 }
             }
             Err(error) => {
@@ -154,9 +248,36 @@ async fn binance_reference_loop(
                         "binance connect error: {error}"
                     )))
                     .await;
+                let _ = send_control(
+                    &tx,
+                    "binance",
+                    "disconnect",
+                    None,
+                    "connect_error",
+                    json!({"error": error.to_string(), "url": &url}),
+                )
+                .await;
+                let _ = send_control(
+                    &tx,
+                    "binance",
+                    "gap_suspected",
+                    None,
+                    "coverage_gap_start",
+                    json!({"reason": "connect_error", "error": error.to_string()}),
+                )
+                .await;
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = send_control(
+            &tx,
+            "binance",
+            "reconnect",
+            None,
+            "reconnect_after_backoff",
+            json!({"sleep_ms": 2_000}),
+        )
+        .await;
     }
 }
 
@@ -170,31 +291,72 @@ async fn okx_reference_loop(
         .map(|symbol| json!({"channel": "candle1s", "instId": format!("{symbol}-USDT")}))
         .collect::<Vec<_>>();
     let subscribe = json!({"op": "subscribe", "args": args}).to_string();
+    let mut overrun = ReferenceOverrunTracker::default();
     loop {
         match connect_async(&options.okx_ws_url).await {
             Ok((mut ws, _)) => {
-                let _ = send_control(&tx, "okx", "connect", None, &options.okx_ws_url).await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "connect",
+                    None,
+                    "connect",
+                    json!({"url": &options.okx_ws_url}),
+                )
+                .await;
                 ws.send(Message::Text(subscribe.clone()))
                     .await
                     .context("send OKX subscribe")?;
-                let _ = send_control(&tx, "okx", "subscribe", None, &subscribe).await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "subscribe",
+                    None,
+                    "initial_subscribe",
+                    json!({
+                        "payload_sha256": sha256_bytes(subscribe.as_bytes()),
+                        "payload": &subscribe,
+                    }),
+                )
+                .await;
+                let mut wrote_gap_control = false;
                 while let Some(message) = ws.next().await {
                     let local_recv_ts_ns = now_unix_ns() as i64;
                     match message {
                         Ok(Message::Text(text)) => {
                             for row in okx_rows_from_text(&text, local_recv_ts_ns)? {
-                                tx.send(ReferenceWriterCommand::Row(row))
-                                    .await
-                                    .map_err(|_| anyhow!("reference writer channel closed"))?;
+                                enqueue_reference_row_nonblocking(
+                                    &tx,
+                                    row,
+                                    &mut overrun,
+                                    "okx",
+                                    None,
+                                )?;
                             }
                         }
                         Ok(Message::Ping(bytes)) => {
                             ws.send(Message::Pong(bytes)).await?;
                         }
                         Ok(Message::Close(frame)) => {
-                            let _ =
-                                send_control(&tx, "okx", "disconnect", None, &format!("{frame:?}"))
-                                    .await;
+                            let _ = send_control(
+                                &tx,
+                                "okx",
+                                "disconnect",
+                                None,
+                                "close_frame",
+                                json!({"close_frame": format!("{frame:?}")}),
+                            )
+                            .await;
+                            let _ = send_control(
+                                &tx,
+                                "okx",
+                                "gap_suspected",
+                                None,
+                                "coverage_gap_start",
+                                json!({"reason": "close_frame", "close_frame": format!("{frame:?}")}),
+                            )
+                            .await;
+                            wrote_gap_control = true;
                             break;
                         }
                         Ok(_) => {}
@@ -204,9 +366,48 @@ async fn okx_reference_loop(
                                     "okx ws error: {error}"
                                 )))
                                 .await;
+                            let _ = send_control(
+                                &tx,
+                                "okx",
+                                "disconnect",
+                                None,
+                                "ws_error",
+                                json!({"error": error.to_string()}),
+                            )
+                            .await;
+                            let _ = send_control(
+                                &tx,
+                                "okx",
+                                "gap_suspected",
+                                None,
+                                "coverage_gap_start",
+                                json!({"reason": "ws_error", "error": error.to_string()}),
+                            )
+                            .await;
+                            wrote_gap_control = true;
                             break;
                         }
                     }
+                }
+                if !wrote_gap_control {
+                    let _ = send_control(
+                        &tx,
+                        "okx",
+                        "disconnect",
+                        None,
+                        "stream_ended",
+                        json!({"reason": "stream_ended"}),
+                    )
+                    .await;
+                    let _ = send_control(
+                        &tx,
+                        "okx",
+                        "gap_suspected",
+                        None,
+                        "coverage_gap_start",
+                        json!({"reason": "stream_ended"}),
+                    )
+                    .await;
                 }
             }
             Err(error) => {
@@ -215,9 +416,36 @@ async fn okx_reference_loop(
                         "okx connect error: {error}"
                     )))
                     .await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "disconnect",
+                    None,
+                    "connect_error",
+                    json!({"error": error.to_string(), "url": &options.okx_ws_url}),
+                )
+                .await;
+                let _ = send_control(
+                    &tx,
+                    "okx",
+                    "gap_suspected",
+                    None,
+                    "coverage_gap_start",
+                    json!({"reason": "connect_error", "error": error.to_string()}),
+                )
+                .await;
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = send_control(
+            &tx,
+            "okx",
+            "reconnect",
+            None,
+            "reconnect_after_backoff",
+            json!({"sleep_ms": 2_000}),
+        )
+        .await;
     }
 }
 
@@ -226,16 +454,50 @@ async fn send_control(
     venue: &str,
     event_type: &str,
     symbol: Option<&str>,
-    payload: &str,
+    operation: &str,
+    details: Value,
 ) -> Result<()> {
-    let raw_payload = payload.as_bytes().to_vec();
+    let row = reference_control_row(
+        tx,
+        venue,
+        event_type,
+        symbol,
+        operation,
+        details,
+        now_unix_ns() as i64,
+    )?;
+    tx.send(ReferenceWriterCommand::Row(row))
+        .await
+        .map_err(|_| anyhow!("reference writer channel closed"))
+}
+
+fn reference_control_row(
+    tx: &mpsc::Sender<ReferenceWriterCommand>,
+    venue: &str,
+    event_type: &str,
+    symbol: Option<&str>,
+    operation: &str,
+    details: Value,
+    local_recv_ts_ns: i64,
+) -> Result<RawReferenceWsEvent> {
+    let raw_payload = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "event_type": event_type,
+        "operation": operation,
+        "component": "reference_ws",
+        "venue": venue,
+        "symbol": symbol.unwrap_or(""),
+        "queue_depth": reference_queue_depth(tx),
+        "channel_capacity": tx.max_capacity(),
+        "details": details,
+    }))?;
     let mut row = RawReferenceWsEvent {
         source_id: format!("{venue}_1s_ws"),
         venue: venue.to_string(),
         symbol: symbol.unwrap_or("").to_string(),
         ingest_seq_scope: "pm5m_reference_ws".to_string(),
         ingest_seq: 0,
-        local_recv_ts_ns: now_unix_ns() as i64,
+        local_recv_ts_ns,
         connection_epoch: 0,
         event_type: event_type.to_string(),
         exchange_event_ts_ms: None,
@@ -252,9 +514,67 @@ async fn send_control(
         raw_record_hash: String::new(),
     };
     row.raw_record_hash = raw_record_hash(&row)?;
-    tx.send(ReferenceWriterCommand::Row(row))
-        .await
-        .map_err(|_| anyhow!("reference writer channel closed"))
+    Ok(row)
+}
+
+fn enqueue_reference_row_nonblocking(
+    tx: &mpsc::Sender<ReferenceWriterCommand>,
+    row: RawReferenceWsEvent,
+    overrun: &mut ReferenceOverrunTracker,
+    venue: &str,
+    symbol: Option<&str>,
+) -> Result<()> {
+    try_flush_reference_overrun_marker(tx, overrun, venue, symbol)?;
+    match tx.try_send(ReferenceWriterCommand::Row(row)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(ReferenceWriterCommand::Row(row))) => {
+            overrun.record_drop(row.local_recv_ts_ns, reference_queue_depth(tx));
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => {
+            overrun.record_drop(now_unix_ns() as i64, reference_queue_depth(tx));
+            Ok(())
+        }
+        Err(TrySendError::Closed(_)) => Err(anyhow!("reference writer channel closed")),
+    }
+}
+
+fn try_flush_reference_overrun_marker(
+    tx: &mpsc::Sender<ReferenceWriterCommand>,
+    overrun: &mut ReferenceOverrunTracker,
+    venue: &str,
+    symbol: Option<&str>,
+) -> Result<()> {
+    if overrun.pending_count == 0 || tx.capacity() == 0 {
+        return Ok(());
+    }
+    let row = reference_control_row(
+        tx,
+        venue,
+        "local_overrun",
+        symbol,
+        "reader_queue_full",
+        json!({
+            "dropped_row_count": overrun.pending_count,
+            "pending_first_ts_ns": overrun.pending_first_ts_ns,
+            "pending_last_ts_ns": overrun.pending_last_ts_ns,
+            "total_dropped_row_count": overrun.total_count,
+            "last_queue_depth": overrun.last_queue_depth,
+        }),
+        now_unix_ns() as i64,
+    )?;
+    match tx.try_send(ReferenceWriterCommand::Row(row)) {
+        Ok(()) => {
+            overrun.clear_pending();
+            Ok(())
+        }
+        Err(TrySendError::Full(_)) => Ok(()),
+        Err(TrySendError::Closed(_)) => Err(anyhow!("reference writer channel closed")),
+    }
+}
+
+fn reference_queue_depth(tx: &mpsc::Sender<ReferenceWriterCommand>) -> u64 {
+    tx.max_capacity().saturating_sub(tx.capacity()) as u64
 }
 
 fn binance_rows_from_text(text: &str, local_recv_ts_ns: i64) -> Result<Vec<RawReferenceWsEvent>> {
@@ -392,6 +712,7 @@ async fn reference_writer_loop(
                                 state.connection_epoch = state.connection_epoch.saturating_add(1);
                                 state.last_error = None;
                             }
+                        apply_reference_local_overrun_row(&mut state, &row);
                         state.next_ingest_seq = state.next_ingest_seq.saturating_add(1);
                         row.ingest_seq = state.next_ingest_seq;
                         row.connection_epoch = state.connection_epoch;
@@ -411,6 +732,7 @@ async fn reference_writer_loop(
                                 &mut rows,
                                 &mut payload_bytes,
                                 &mut segment_started_at,
+                                rx.len() as u64,
                             )?;
                         }
                     }
@@ -424,6 +746,8 @@ async fn reference_writer_loop(
                                 rows.len() as u64,
                                 payload_bytes as u64,
                                 None,
+                                rx.len() as u64,
+                                rows.len() as u64,
                                 state.last_error.clone(),
                             )?;
                         }
@@ -443,6 +767,7 @@ async fn reference_writer_loop(
                         &mut rows,
                         &mut payload_bytes,
                             &mut segment_started_at,
+                            rx.len() as u64,
                         )?;
                     } else {
                         append_reference_health(
@@ -452,6 +777,8 @@ async fn reference_writer_loop(
                             rows.len() as u64,
                             payload_bytes as u64,
                             None,
+                            rx.len() as u64,
+                            rows.len() as u64,
                             None,
                         )?;
                     }
@@ -464,6 +791,7 @@ async fn reference_writer_loop(
         &mut rows,
         &mut payload_bytes,
         &mut segment_started_at,
+        rx.len() as u64,
     )?;
     Ok(())
 }
@@ -486,6 +814,7 @@ fn flush_reference_rows(
     rows: &mut Vec<RawReferenceWsEvent>,
     payload_bytes: &mut usize,
     segment_started_at: &mut Instant,
+    queue_depth: u64,
 ) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
@@ -514,6 +843,8 @@ fn flush_reference_rows(
         rows.len() as u64,
         *payload_bytes as u64,
         Some(started.elapsed().as_millis() as u64),
+        queue_depth,
+        rows.len() as u64,
         None,
     )?;
     rows.clear();
@@ -529,6 +860,8 @@ fn append_reference_health(
     rows: u64,
     payload_bytes: u64,
     flush_elapsed_ms: Option<u64>,
+    queue_depth: u64,
+    writer_buffer_rows: u64,
     error: Option<String>,
 ) -> Result<()> {
     let now_ns = now_unix_ns() as i64;
@@ -558,9 +891,33 @@ fn append_reference_health(
             current_asset_count: None,
             last_recv_ts_ns: state.last_recv_ts_ns,
             last_recv_age_ms: last_recv_age_ms(now_ns, state.last_recv_ts_ns),
+            queue_depth: Some(queue_depth),
+            writer_buffer_rows: Some(writer_buffer_rows),
+            local_overrun_count: Some(state.local_overrun_count),
+            local_overrun_last_ts_ns: state.local_overrun_last_ts_ns,
             error: error.or_else(|| state.last_error.clone()),
         },
     )
+}
+
+fn apply_reference_local_overrun_row(
+    state: &mut ReferenceWsRecorderState,
+    row: &RawReferenceWsEvent,
+) {
+    if row.event_type != "local_overrun" {
+        return;
+    }
+    let dropped = serde_json::from_slice::<Value>(&row.raw_payload)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("details")
+                .and_then(|details| details.get("dropped_row_count"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(1);
+    state.local_overrun_count = state.local_overrun_count.saturating_add(dropped);
+    state.local_overrun_last_ts_ns = Some(row.local_recv_ts_ns);
 }
 
 fn reference_hftrec4_rows(rows: &[RawReferenceWsEvent]) -> Result<Vec<Hftrec4WriteRecord>> {
@@ -628,6 +985,11 @@ fn write_reference_run_manifest(options: &ReferenceWsRecorderOptions) -> Result<
             "binance_ws_url": options.binance_ws_url,
             "okx_ws_url": options.okx_ws_url,
         }))?)),
+        git_sha: current_git_sha(),
+        binary_sha256: current_binary_sha256(),
+        host: current_host(),
+        command_line: command_line(),
+        alignment_policy: Some(RecorderAlignmentPolicy::live_replay_default()),
         outputs: vec![
             "reference_ws_state.json".to_string(),
             RECORDER_HEALTH_STREAM.to_string(),

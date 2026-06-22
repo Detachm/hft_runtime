@@ -22,8 +22,10 @@ Live recording only:
 - discovers Polymarket PM5M markets through Gamma/CLOB metadata
 - subscribes to Polymarket CLOB market websocket
 - writes HFTREC4 WS raw audit
-- optionally double-writes HFTBOOK2 book-state cache
-- records Binance reference WS events and recorder audit profile when run through `run-dual`
+- records one production Polymarket symbol shard per process for BTC/ETH/SOL 5m/15m
+- records Binance reference WS events and recorder audit profile through a separate reference process
+- emits structured coverage rows such as `disconnect`, `gap_suspected`, `reconnect`, and
+  `local_overrun`
 - maintains recorder state and evidence
 
 It must not depend on `pm5m_data_etl`, run backtests, build research features, or write old raw
@@ -67,8 +69,11 @@ artifacts.
 
 ## Scripts
 
-- `scripts/run_pm5m_recorder_supervised.sh`: long-running dual CLOB/reference recorder wrapper.
+- `scripts/run_pm5m_recorder_supervised.sh`: role-based supervisor for `poly_btc`, `poly_eth`,
+  `poly_sol`, and `reference_binance`.
 - `scripts/private/perf_gate_pm5m.sh`: static and real-path performance gate.
 - `scripts/check_production_artifact_boundary.sh`: package boundary guard.
 
-Scripts must call current CLIs only. In particular, recorder scripts must use `pm5m-recorder run-dual`.
+Scripts must call current CLIs only. Production recorder scripts must split Poly and reference
+recording with `pm5m-recorder run-ws` and `pm5m-recorder run-reference-ws`; `run-dual` is retired
+for production.

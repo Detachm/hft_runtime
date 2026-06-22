@@ -19,7 +19,7 @@ There is one active PM5M chain:
 Polymarket CLOB websocket
 Binance 1s reference websocket
   -> HFTREC4 raw WS audit
-  -> HFTBOOK2 strategy-neutral book_state cache
+  -> HFTBOOK2 strategy-neutral book_state cache, built offline from raw
   -> HFTIDX1 file-backed book_state index
   -> HFTREF1 reference cache
   -> HFTSETTLE1 official settlement cache
@@ -43,7 +43,7 @@ Retired PM5M paths must not be reintroduced:
 Workspace crates:
 
 - `market_data_etl_core`: shared IO, hashing, Parquet/ZSTD, HFTREC4, atomic writes.
-- `pm5m_recorder`: live Polymarket discovery, CLOB WS recording, and Binance reference WS audit profile recording.
+- `pm5m_recorder`: live Polymarket discovery, sharded CLOB WS recording, and Binance reference WS audit profile recording.
 - `pm5m_market_cache`: HFTBOOK2/HFTIDX1/HFTREF1/HFTSETTLE1 builders, validators, benches.
 - `pm5m_data_etl`: Jupiter typed Parquet ETL/export contract. Not the fast backtest hot path.
 
@@ -54,16 +54,14 @@ Private crate:
 
 ## Common Commands
 
-Run the dual recorder. This records Polymarket CLOB into HFTREC4/HFTBOOK2 and Binance 1s
-reference metadata/audit profile for later live-vs-local alignment:
+Run the production recorders. These keep Poly and Binance recording independent, reduce subscription
+surface, and write explicit coverage rows for live-vs-local alignment:
 
 ```sh
-ROOT_DIR=/home/hliu/hft_runtime \
-CONFIG=/home/hliu/hft_runtime/configs/pm5m-recorder-hftrec4.example.json \
-RAW_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/raw \
-STATE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/state \
-BOOK_STATE_CACHE_ROOT=/mnt/data/hft/hft_runtime/live_polymarket_all_current_hftrec4_ws_raw/book_hftbook2 \
-scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_btc scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_eth scripts/run_pm5m_recorder_supervised.sh
+ROLE=poly_sol scripts/run_pm5m_recorder_supervised.sh
+ROLE=reference_binance scripts/run_pm5m_recorder_supervised.sh
 ```
 
 Build and validate the fast cache/index:
