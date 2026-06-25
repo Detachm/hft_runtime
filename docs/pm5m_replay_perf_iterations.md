@@ -231,12 +231,14 @@ condition workers and workers maintain replay state locally.
 Result:
 
 - condition-direct 16 workers: 64.101s / 3h
+- after optimizing the update router to avoid the common single-asset clone path: 55.210s / 3h
 - aggregate strategy results still matched serial
 - worse than previous condition-direct and much worse than serial/symbol parallel
 
-Reason: sending cloned typed updates through channels moved too much data and increased worker-side
-on-book work. This is not the right route unless compact updates are partitioned before decode or
-sent as very small borrowed/encoded records with strict per-condition ordering.
+Reason: sending typed updates through channels moved too much data and increased worker-side on-book
+work. Avoiding the common clone path helped but not enough. This is not the right route unless
+compact updates are partitioned before decode or sent as very small borrowed/encoded records with
+strict per-condition ordering.
 
 Status: reverted.
 
