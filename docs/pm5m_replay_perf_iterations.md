@@ -188,3 +188,68 @@ Deep profile:
 Next target: remove the single-threaded global heap/merge tax by partitioning independent market
 streams, or reduce V1/on-book work by avoiding repeated string/interner lookups in the strategy hot
 path. The current single-thread path still linearly extrapolates far above the 5-minute 7d target.
+
+## Iteration 4 Result, 2026-06-26
+
+Change: enable `parallel_by_symbol` for compact typed input in the private comparator and filter
+typed roots/files per symbol shard so BTC/ETH/SOL workers do not each scan all roots.
+
+Status:
+
+- Correctness: aggregate actual/current/V1 orders, fills, cash, qty, fees, settlement payout, and
+  final PnL matched the serial iteration-3 run exactly.
+- Caveat: the merged symbol summary does not produce the same single serial intent-stream hash,
+  because artifacts remain per symbol shard. Book event counts match serial; reference event counts
+  are counted per shard.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Code path is still in ignored `hft_private/`.
+
+Default compact typed symbol-parallel run:
+
+- serial iteration 3: 38.597s / 3h
+- symbol parallel 3 workers: 26.828s / 3h
+- improvement vs iteration 3 serial: 11.769s / 3h, 30.5%
+- improvement vs baseline serial: 19.965s / 3h, 42.7%
+- linear 7d estimate: 25.0 min
+- linear 30d estimate: 1.79 h
+
+Shard wall times:
+
+- BTC-5M: 26.298s, 10,464,099 book events
+- ETH-5M: 6.484s, 2,528,138 book events
+- SOL-5M: 4.471s, 1,830,823 book events
+
+Conclusion: symbol parallelism is worthwhile but BTC dominates, so three workers is not enough for
+the 7d 5-minute target. Further speedup must split BTC internally without reintroducing a single
+dispatcher bottleneck.
+
+## Rejected Attempt: Condition Update Dispatch, 2026-06-26
+
+Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
+condition workers and workers maintain replay state locally.
+
+Result:
+
+- condition-direct 16 workers: 64.101s / 3h
+- aggregate strategy results still matched serial
+- worse than previous condition-direct and much worse than serial/symbol parallel
+
+Reason: sending cloned typed updates through channels moved too much data and increased worker-side
+on-book work. This is not the right route unless compact updates are partitioned before decode or
+sent as very small borrowed/encoded records with strict per-condition ordering.
+
+Status: reverted.
+
+## Rejected Attempt: V1 Lookup Cache, 2026-06-26
+
+Attempt: cache `symbol`/`outcome` lookups in `FrozenSingleLegStrategy::on_book_snapshot_event`.
+
+Result:
+
+- serial run: 38.672s / 3h
+- hashes matched, but no material improvement vs 38.597s iteration 3
+
+Reason: repeated symbol/outcome lookup is not the limiting cost; the remaining V1 bucket is mostly
+actual decision/sweep/cache work and surrounding event flow.
+
+Status: reverted.
