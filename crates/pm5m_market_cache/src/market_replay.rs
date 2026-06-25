@@ -4534,56 +4534,21 @@ fn read_compact_typed_records(path: &Path) -> Result<Vec<MarketReplayCompactType
     read_compact_typed_records_profiled(path, None)
 }
 
+struct CompactTypedSegmentSections {
+    header: CompactTypedSegmentHeader,
+    metadata: Vec<u8>,
+    body: Vec<u8>,
+}
+
 fn read_compact_typed_records_profiled(
     path: &Path,
     mut profile: Option<&mut MarketReplayStreamProfile>,
 ) -> Result<Vec<MarketReplayCompactTypedRecord>> {
-    let header_started = profile.is_some().then(Instant::now);
-    let mut reader =
-        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
-    let header = read_compact_typed_header_from_reader(&mut reader, path)?;
-    if let (Some(started), Some(profile)) = (header_started, profile.as_deref_mut()) {
-        profile.compact_header_read_ns = profile
-            .compact_header_read_ns
-            .saturating_add(started.elapsed().as_nanos());
-    }
-    let expected_metadata_len = usize::try_from(header.record_count)
-        .ok()
-        .and_then(|rows| rows.checked_mul(COMPACT_TYPED_META_LEN))
-        .context("compact typed metadata length overflow")?;
-    if usize::try_from(header.metadata_len).ok() != Some(expected_metadata_len) {
-        bail!("compact typed metadata byte length mismatch");
-    }
-    let metadata_len =
-        usize::try_from(header.metadata_len).context("compact typed metadata len")?;
-    let body_len = usize::try_from(header.body_len).context("compact typed body len")?;
-    let mut metadata = vec![0u8; metadata_len];
-    let metadata_started = profile.is_some().then(Instant::now);
-    reader
-        .read_exact(&mut metadata)
-        .with_context(|| format!("read compact typed metadata {}", path.display()))?;
-    if let (Some(started), Some(profile)) = (metadata_started, profile.as_deref_mut()) {
-        profile.compact_metadata_read_ns = profile
-            .compact_metadata_read_ns
-            .saturating_add(started.elapsed().as_nanos());
-    }
-    let mut body = vec![0u8; body_len];
-    let body_started = profile.is_some().then(Instant::now);
-    reader
-        .read_exact(&mut body)
-        .with_context(|| format!("read compact typed body {}", path.display()))?;
-    if let (Some(started), Some(profile)) = (body_started, profile.as_deref_mut()) {
-        profile.compact_body_read_ns = profile
-            .compact_body_read_ns
-            .saturating_add(started.elapsed().as_nanos());
-    }
-    let mut trailing = [0u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        bail!(
-            "compact typed segment has trailing bytes: {}",
-            path.display()
-        );
-    }
+    let CompactTypedSegmentSections {
+        header,
+        metadata,
+        body,
+    } = read_compact_typed_segment_sections(path, profile.as_deref_mut())?;
     let mut out = Vec::with_capacity(header.record_count as usize);
     let decode_started = profile.is_some().then(Instant::now);
     for row_idx in 0..(header.record_count as usize) {
@@ -4644,6 +4609,63 @@ fn read_compact_typed_records_profiled(
     Ok(out)
 }
 
+fn read_compact_typed_segment_sections(
+    path: &Path,
+    mut profile: Option<&mut MarketReplayStreamProfile>,
+) -> Result<CompactTypedSegmentSections> {
+    let header_started = profile.is_some().then(Instant::now);
+    let mut reader =
+        BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
+    let header = read_compact_typed_header_from_reader(&mut reader, path)?;
+    if let (Some(started), Some(profile)) = (header_started, profile.as_deref_mut()) {
+        profile.compact_header_read_ns = profile
+            .compact_header_read_ns
+            .saturating_add(started.elapsed().as_nanos());
+    }
+    let expected_metadata_len = usize::try_from(header.record_count)
+        .ok()
+        .and_then(|rows| rows.checked_mul(COMPACT_TYPED_META_LEN))
+        .context("compact typed metadata length overflow")?;
+    if usize::try_from(header.metadata_len).ok() != Some(expected_metadata_len) {
+        bail!("compact typed metadata byte length mismatch");
+    }
+    let metadata_len =
+        usize::try_from(header.metadata_len).context("compact typed metadata len")?;
+    let body_len = usize::try_from(header.body_len).context("compact typed body len")?;
+    let mut metadata = vec![0u8; metadata_len];
+    let metadata_started = profile.is_some().then(Instant::now);
+    reader
+        .read_exact(&mut metadata)
+        .with_context(|| format!("read compact typed metadata {}", path.display()))?;
+    if let (Some(started), Some(profile)) = (metadata_started, profile.as_deref_mut()) {
+        profile.compact_metadata_read_ns = profile
+            .compact_metadata_read_ns
+            .saturating_add(started.elapsed().as_nanos());
+    }
+    let mut body = vec![0u8; body_len];
+    let body_started = profile.is_some().then(Instant::now);
+    reader
+        .read_exact(&mut body)
+        .with_context(|| format!("read compact typed body {}", path.display()))?;
+    if let (Some(started), Some(profile)) = (body_started, profile.as_deref_mut()) {
+        profile.compact_body_read_ns = profile
+            .compact_body_read_ns
+            .saturating_add(started.elapsed().as_nanos());
+    }
+    let mut trailing = [0u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        bail!(
+            "compact typed segment has trailing bytes: {}",
+            path.display()
+        );
+    }
+    Ok(CompactTypedSegmentSections {
+        header,
+        metadata,
+        body,
+    })
+}
+
 fn read_compact_typed_header(path: &Path) -> Result<CompactTypedSegmentHeader> {
     let mut reader =
         BufReader::new(File::open(path).with_context(|| format!("open {}", path.display()))?);
@@ -4680,6 +4702,162 @@ fn read_compact_typed_header_from_reader<R: Read>(
     Ok(header)
 }
 
+fn enqueue_compact_typed_segment_records(
+    candidate: &CompactTypedCandidateManifest,
+    build_options: &BuildMarketReplayDatasetOptions,
+    symbol_filter: &SymbolFilter,
+    pending: &mut BinaryHeap<Reverse<OrderedCompactTypedUpdate>>,
+    profile: &mut MarketReplayStreamProfile,
+    deep_profile: bool,
+) -> Result<()> {
+    let segment_started = Instant::now();
+    let sections = if deep_profile {
+        read_compact_typed_segment_sections(&candidate.segment_path, Some(profile))?
+    } else {
+        read_compact_typed_segment_sections(&candidate.segment_path, None)?
+    };
+    let CompactTypedSegmentSections {
+        header,
+        metadata,
+        body,
+    } = sections;
+    let record_count = header.record_count as usize;
+    profile.selected_record_count = profile.selected_record_count.saturating_add(record_count);
+    let source_segment = header.raw_segment_path.display().to_string();
+    let mut filter_ns = 0u128;
+    let mut pending_push_ns = 0u128;
+    let mut decode_ns = 0u128;
+
+    for row_idx in 0..record_count {
+        let decode_started = deep_profile.then(Instant::now);
+        let start = row_idx
+            .checked_mul(COMPACT_TYPED_META_LEN)
+            .context("compact typed metadata row offset overflow")?;
+        let end = start + COMPACT_TYPED_META_LEN;
+        let meta = decode_compact_typed_meta(&metadata[start..end])?;
+        if let Some(started) = decode_started {
+            decode_ns = decode_ns.saturating_add(started.elapsed().as_nanos());
+        }
+
+        let filter_started = deep_profile.then(Instant::now);
+        if !ts_before_end(meta.original_local_recv_ts_ns, build_options) {
+            if let Some(started) = filter_started {
+                filter_ns = filter_ns.saturating_add(started.elapsed().as_nanos());
+            }
+            continue;
+        }
+        let symbol_ref = optional_compact_dict_str(&header.symbols, meta.symbol_key, "symbol")?;
+        if symbol_ref
+            .and_then(canonical_market_symbol)
+            .is_some_and(|symbol| !symbol_filter.allows(&symbol))
+        {
+            if let Some(started) = filter_started {
+                filter_ns = filter_ns.saturating_add(started.elapsed().as_nanos());
+            }
+            continue;
+        }
+        let visible_ts_ns = compact_typed_visible_ts_ns_for_event_code(
+            meta.original_local_recv_ts_ns,
+            compact_optional_i64(meta.exchange_ts_ms),
+            meta.event_type_code,
+            build_options,
+        );
+        if !ts_in_window(visible_ts_ns, build_options) {
+            if let Some(started) = filter_started {
+                filter_ns = filter_ns.saturating_add(started.elapsed().as_nanos());
+            }
+            continue;
+        }
+        if let Some(started) = filter_started {
+            filter_ns = filter_ns.saturating_add(started.elapsed().as_nanos());
+        }
+
+        let decode_started = deep_profile.then(Instant::now);
+        let body_start =
+            usize::try_from(meta.body_offset).context("compact typed body offset usize")?;
+        let body_end = body_start
+            .checked_add(meta.body_len as usize)
+            .context("compact typed body row end overflow")?;
+        let body_slice = body.get(body_start..body_end).ok_or_else(|| {
+            anyhow!("compact typed body row {row_idx} points outside body section")
+        })?;
+        let typed_body =
+            decode_compact_typed_body(meta.event_type_code, body_slice, &header.assets)?;
+        let event_type = compact_event_type_from_code(meta.event_type_code)?.to_string();
+        let symbol = symbol_ref.map(str::to_string);
+        let market_start_ts_ns = compact_optional_i64(meta.market_start_ts_ns);
+        let market_end_ts_ns = compact_optional_i64(meta.market_end_ts_ns);
+        let horizon_seconds =
+            horizon_seconds(market_start_ts_ns, market_end_ts_ns, symbol.as_deref());
+        let condition_id =
+            optional_compact_dict_str(&header.conditions, meta.condition_key, "condition")?
+                .map(str::to_string);
+        let payload_hash = digest_32_bytes_to_hex(&meta.payload_sha256);
+        let key_asset_id = optional_compact_dict_str(&header.assets, meta.key_asset_key, "asset")?
+            .unwrap_or_default()
+            .to_string();
+        let update = MarketReplayTypedUpdate {
+            schema_version: 1,
+            dataset_format: String::new(),
+            global_event_seq: 0,
+            symbol,
+            horizon_seconds,
+            condition_id,
+            event_type,
+            original_local_recv_ts_ns: meta.original_local_recv_ts_ns,
+            visible_ts_ns,
+            ingest_seq: meta.ingest_seq,
+            source_row_idx: meta.source_row_idx,
+            payload_hash,
+            market_start_ts_ns,
+            market_end_ts_ns,
+            body: typed_body,
+        };
+        if let Some(started) = decode_started {
+            decode_ns = decode_ns.saturating_add(started.elapsed().as_nanos());
+        }
+
+        let push_started = deep_profile.then(Instant::now);
+        let key = MarketEventSortKey {
+            visible_ts_ns: update.visible_ts_ns,
+            local_recv_ts_ns: update.original_local_recv_ts_ns,
+            ingest_seq: update.ingest_seq,
+            source_segment: source_segment.clone(),
+            source_row_idx: update.source_row_idx,
+            sequence: 0,
+            asset_id: key_asset_id,
+            event_type: update.event_type.clone(),
+        };
+        pending.push(Reverse(OrderedCompactTypedUpdate { key, update }));
+        profile.selected_update_count = profile.selected_update_count.saturating_add(1);
+        if let Some(started) = push_started {
+            pending_push_ns = pending_push_ns.saturating_add(started.elapsed().as_nanos());
+        }
+    }
+
+    if deep_profile {
+        profile.compact_record_decode_ns =
+            profile.compact_record_decode_ns.saturating_add(decode_ns);
+        profile.compact_record_filter_ns =
+            profile.compact_record_filter_ns.saturating_add(filter_ns);
+        profile.compact_pending_push_ns = profile
+            .compact_pending_push_ns
+            .saturating_add(pending_push_ns);
+        profile.compact_segment_read_ns = profile.compact_segment_read_ns.saturating_add(
+            segment_started
+                .elapsed()
+                .as_nanos()
+                .saturating_sub(filter_ns)
+                .saturating_sub(pending_push_ns),
+        );
+    } else {
+        profile.compact_segment_read_ns = profile
+            .compact_segment_read_ns
+            .saturating_add(segment_started.elapsed().as_nanos());
+    }
+    Ok(())
+}
+
 fn stream_compact_typed_updates_from_files<I, F>(
     paths: I,
     options: &StreamMarketReplayEventsOptions,
@@ -4707,107 +4885,14 @@ where
     let order_holdback_ns = market_replay_order_holdback_ns(&build_options);
     for idx in 0..candidates.len() {
         let candidate = &candidates[idx];
-        let read_started = Instant::now();
-        let records = if deep_profile {
-            read_compact_typed_records_profiled(&candidate.segment_path, Some(&mut profile))?
-        } else {
-            read_compact_typed_records(&candidate.segment_path)?
-        };
-        profile.compact_segment_read_ns = profile
-            .compact_segment_read_ns
-            .saturating_add(read_started.elapsed().as_nanos());
-        profile.selected_record_count = profile.selected_record_count.saturating_add(records.len());
-        if deep_profile {
-            for record in records {
-                let mut update = record.update;
-                let filter_started = Instant::now();
-                if !ts_before_end(update.original_local_recv_ts_ns, &build_options) {
-                    profile.compact_record_filter_ns = profile
-                        .compact_record_filter_ns
-                        .saturating_add(filter_started.elapsed().as_nanos());
-                    continue;
-                }
-                if update
-                    .symbol
-                    .as_deref()
-                    .and_then(canonical_market_symbol)
-                    .is_some_and(|symbol| !symbol_filter.allows(&symbol))
-                {
-                    profile.compact_record_filter_ns = profile
-                        .compact_record_filter_ns
-                        .saturating_add(filter_started.elapsed().as_nanos());
-                    continue;
-                }
-                update.visible_ts_ns = compact_typed_visible_ts_ns(
-                    update.original_local_recv_ts_ns,
-                    record.exchange_ts_ms,
-                    &update.event_type,
-                    &build_options,
-                );
-                if !ts_in_window(update.visible_ts_ns, &build_options) {
-                    profile.compact_record_filter_ns = profile
-                        .compact_record_filter_ns
-                        .saturating_add(filter_started.elapsed().as_nanos());
-                    continue;
-                }
-                profile.compact_record_filter_ns = profile
-                    .compact_record_filter_ns
-                    .saturating_add(filter_started.elapsed().as_nanos());
-
-                let push_started = Instant::now();
-                let key = MarketEventSortKey {
-                    visible_ts_ns: update.visible_ts_ns,
-                    local_recv_ts_ns: update.original_local_recv_ts_ns,
-                    ingest_seq: update.ingest_seq,
-                    source_segment: record.raw_segment_path.display().to_string(),
-                    source_row_idx: update.source_row_idx,
-                    sequence: 0,
-                    asset_id: record.key_asset_id.unwrap_or_default(),
-                    event_type: update.event_type.clone(),
-                };
-                pending.push(Reverse(OrderedCompactTypedUpdate { key, update }));
-                profile.selected_update_count = profile.selected_update_count.saturating_add(1);
-                profile.compact_pending_push_ns = profile
-                    .compact_pending_push_ns
-                    .saturating_add(push_started.elapsed().as_nanos());
-            }
-        } else {
-            for record in records {
-                let mut update = record.update;
-                if !ts_before_end(update.original_local_recv_ts_ns, &build_options) {
-                    continue;
-                }
-                if update
-                    .symbol
-                    .as_deref()
-                    .and_then(canonical_market_symbol)
-                    .is_some_and(|symbol| !symbol_filter.allows(&symbol))
-                {
-                    continue;
-                }
-                update.visible_ts_ns = compact_typed_visible_ts_ns(
-                    update.original_local_recv_ts_ns,
-                    record.exchange_ts_ms,
-                    &update.event_type,
-                    &build_options,
-                );
-                if !ts_in_window(update.visible_ts_ns, &build_options) {
-                    continue;
-                }
-                let key = MarketEventSortKey {
-                    visible_ts_ns: update.visible_ts_ns,
-                    local_recv_ts_ns: update.original_local_recv_ts_ns,
-                    ingest_seq: update.ingest_seq,
-                    source_segment: record.raw_segment_path.display().to_string(),
-                    source_row_idx: update.source_row_idx,
-                    sequence: 0,
-                    asset_id: record.key_asset_id.unwrap_or_default(),
-                    event_type: update.event_type.clone(),
-                };
-                pending.push(Reverse(OrderedCompactTypedUpdate { key, update }));
-                profile.selected_update_count = profile.selected_update_count.saturating_add(1);
-            }
-        }
+        enqueue_compact_typed_segment_records(
+            candidate,
+            &build_options,
+            &symbol_filter,
+            &mut pending,
+            &mut profile,
+            deep_profile,
+        )?;
         let flush_before_or_at_ts = candidates
             .get(idx + 1)
             .and_then(|candidate| candidate.min_local_recv_ts_ns)
@@ -5023,6 +5108,24 @@ fn compact_typed_visible_ts_ns(
     }
 }
 
+fn compact_typed_visible_ts_ns_for_event_code(
+    original_local_recv_ts_ns: i64,
+    exchange_ts_ms: Option<i64>,
+    event_type_code: u8,
+    options: &BuildMarketReplayDatasetOptions,
+) -> i64 {
+    if event_type_code == 2 {
+        compact_typed_visible_ts_ns(
+            original_local_recv_ts_ns,
+            exchange_ts_ms,
+            "price_change",
+            options,
+        )
+    } else {
+        original_local_recv_ts_ns
+    }
+}
+
 fn encode_compact_typed_metadata(rows: &[CompactTypedRecordMeta]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rows.len() * COMPACT_TYPED_META_LEN);
     for row in rows {
@@ -5189,10 +5292,28 @@ fn optional_compact_dict_value(values: &[String], key: u32, field: &str) -> Resu
     required_compact_dict_value(values, key, field).map(Some)
 }
 
+fn optional_compact_dict_str<'a>(
+    values: &'a [String],
+    key: u32,
+    field: &str,
+) -> Result<Option<&'a str>> {
+    if key == COMPACT_TYPED_NONE_U32 {
+        return Ok(None);
+    }
+    required_compact_dict_str(values, key, field).map(Some)
+}
+
 fn required_compact_dict_value(values: &[String], key: u32, field: &str) -> Result<String> {
     values
         .get(key as usize)
         .cloned()
+        .ok_or_else(|| anyhow!("compact typed {field} key {key} out of range"))
+}
+
+fn required_compact_dict_str<'a>(values: &'a [String], key: u32, field: &str) -> Result<&'a str> {
+    values
+        .get(key as usize)
+        .map(|value| value.as_str())
         .ok_or_else(|| anyhow!("compact typed {field} key {key} out of range"))
 }
 

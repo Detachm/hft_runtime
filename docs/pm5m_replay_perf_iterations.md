@@ -223,6 +223,62 @@ Conclusion: symbol parallelism is worthwhile but BTC dominates, so three workers
 the 7d 5-minute target. Further speedup must split BTC internally without reintroducing a single
 dispatcher bottleneck.
 
+## Iteration 5 Result, 2026-06-26
+
+Change: stream compact typed segments directly into the existing ordered pending heap instead of
+first materializing a `Vec<MarketReplayCompactTypedRecord>`. The new path still uses the same
+segment ordering, order holdback, `MarketEventSortKey`, and callback sequence; it only removes the
+intermediate record vector, per-record `PathBuf` clone, and one redundant `dataset_format`
+allocation before the final emitted update is assigned its canonical format.
+
+Status:
+
+- Correctness: serial 3h golden hashes matched all four expected hashes.
+- Public tests: `cargo test -p pm5m_market_cache` passed.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Public code path is commit-ready; private runner still supplies the exact replay workload.
+
+Default compact typed serial run:
+
+- iteration 3 serial: 38.597s / 3h
+- iteration 5 serial: 35.608s / 3h
+- improvement vs iteration 3 serial: 2.989s / 3h, 7.7%
+- linear 7d estimate: 33.2 min
+- linear 30d estimate: 2.37 h
+
+Default compact typed symbol-parallel run:
+
+- iteration 4 symbol-parallel: 26.828s / 3h
+- iteration 5 symbol-parallel: 24.968s / 3h
+- improvement vs iteration 4: 1.860s / 3h, 6.9%
+- linear 7d estimate: 23.3 min
+- linear 30d estimate: 1.66 h
+
+Deep profile, symbol-parallel:
+
+- elapsed: 32.038s -> 30.519s / 3h
+- `raw_stream_excluding_callback_ns`: 18.422s -> 15.921s
+- `compact_record_decode_ns`: 5.252s -> 4.012s
+- `compact_pending_push_ns`: 2.804s -> 1.993s
+- `merge_flush_ns`: 5.226s -> 4.925s
+- `callback_total_ns`: 25.408s -> 24.465s
+- `apply_raw_update_ns`: 14.745s -> 14.207s
+- `book_row_build_ns`: 6.135s -> 6.059s
+- `v1_on_book_event_ns`: 4.132s -> 3.960s
+
+Shard wall times in deep mode:
+
+- BTC-5M: 29.734s, 10,464,099 book events
+- ETH-5M: 7.077s, 2,528,138 book events
+- SOL-5M: 4.945s, 1,830,823 book events
+
+Conclusion: this was a valid constant-factor improvement in the compact stream path, but it does
+not change the first-order bottleneck. BTC remains one mostly single-threaded replay stream. The
+largest remaining exact buckets are callback/apply state maintenance, BookRow construction, and
+ordered heap merge. To reach 7d under 5 minutes, the next material step still has to split BTC's
+independent market work without a central per-update dispatcher and without resetting strategy
+state incorrectly.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
