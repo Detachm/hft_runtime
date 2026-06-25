@@ -525,3 +525,70 @@ now faster, but still not close to the 7-day under-5-minute target. The wall clo
 the BTC shard, so symbol-level parallelism has largely hit its ceiling for the current 3-symbol
 workload. The remaining first-order problem is exact parallelism inside BTC, not more timers or small
 lookup caches.
+
+## Rejected Attempt: Naive Market-Slice Parallelism, 2026-06-26
+
+Attempt: split each symbol into independent time slices and run each slice in parallel using the
+existing serial compact typed runner, then merge shard summaries. This was tested with 5m, 15m, and
+60m slices.
+
+Result:
+
+- 5m slices, 108 tasks, 16 workers: 9.295s / 3h, current summary matched, V1 duplicated orders
+  (`355 -> 695`).
+- 15m slices, 36 tasks, 16 workers: 6.388s / 3h, current summary matched, V1 duplicated orders
+  (`355 -> 548`).
+- 60m slices, 9 tasks, 16 workers: 8.275s / 3h, current summary matched, V1 still differed
+  (`355 -> 422`).
+
+Reason: resetting strategy state at time-slice boundaries is not exact for V1. The frozen strategy's
+per-asset entry count is stateful, and boundary-visible books can appear in adjacent slices. This
+causes either duplicate entries or, after ownership gating experiments, missed V1 conditions.
+
+Status: rejected and reverted. The speed is promising, but the decomposition must be by unique
+condition/asset ownership with exact event/state semantics, not by naive local time windows.
+
+## Rejected Attempt: Market-Slice Ownership Gate, 2026-06-26
+
+Attempt: keep 15m market slices but only allow book-event strategy callbacks when a book's
+`window_start_ts_ns` belongs to that slice. Additional scan overlap and a hybrid replay window were
+tested to avoid losing boundary state.
+
+Result:
+
+- 15m ownership gate without overlap: 5.374s / 3h, current matched, V1 undercounted
+  (`355 -> 222`).
+- 15m ownership gate with 15m scan overlap: 8.462s / 3h, current matched, V1 undercounted
+  (`355 -> 228`).
+- 15m hybrid window with 15m scan overlap: 8.317s / 3h, current matched, V1 undercounted
+  (`355 -> 317`).
+- 60m hybrid window with 60m scan overlap: 17.743s / 3h, current matched, V1 still differed
+  (`355 -> 334`).
+
+Reason: the condition ownership rule alone is not sufficient when the child runner's local state is
+rebuilt from a sliced scan. Some V1 decisions depend on the exact sequence of prior book/reference
+visibility and per-asset entry state; the overlap either still misses conditions or expands work back
+toward the serial path.
+
+Status: rejected and reverted.
+
+## Rejected Probe: Condition-Direct Channels, 2026-06-26
+
+Probe: rerun the existing exact condition-direct dispatcher on the latest code with 16 condition
+workers.
+
+Result:
+
+- elapsed: 54.664s internal / 57.09s wall for 3h
+- correctness: current and V1 summaries matched the exact baseline
+- CPU utilization: only 197%
+- context switches: ~4.83M
+- profile highlights: raw stream 54.143s, callback total 75.977s across workers,
+  on-book event 34.686s, latest book lookup 2.847s
+
+Reason: this path preserves exact condition ownership, but the dispatcher/channel design is too
+expensive and does not keep the hardware busy. It is not a viable production route without replacing
+the per-update channel dispatch shape.
+
+Status: rejected as a runtime path. The useful lesson is that exact condition ownership is the right
+semantic boundary, but it needs a lower-overhead partition/worker design.
