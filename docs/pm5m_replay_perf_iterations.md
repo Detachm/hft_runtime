@@ -592,3 +592,22 @@ the per-update channel dispatch shape.
 
 Status: rejected as a runtime path. The useful lesson is that exact condition ownership is the right
 semantic boundary, but it needs a lower-overhead partition/worker design.
+
+## Rejected Attempt: Compact Source Segment Rank, 2026-06-26
+
+Attempt: replace the compact typed heap key's `source_segment` string tie-breaker with a precomputed
+numeric rank. The rank was built from sorted raw segment path strings, so it should preserve the same
+tie-break order while reducing hot heap-key comparison cost.
+
+Result:
+
+- first default symbol-parallel run: 18.763s -> 17.950s / 3h
+- repeated default symbol-parallel run: 19.670s / 3h
+- deep profile got worse: 27.806s -> 29.513s / 3h
+- serial 3h golden hashes matched all four expected hashes
+
+Reason: the apparent first-run win was not stable. The additional rank-map setup and changed key
+shape did not reduce the measured compact merge/decode path in deep profile; it increased the total
+runtime in the repeated/default and deep runs.
+
+Status: rejected and reverted.
