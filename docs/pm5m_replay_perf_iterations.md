@@ -572,6 +572,26 @@ toward the serial path.
 
 Status: rejected and reverted.
 
+## Rejected Attempt: Condition-Direct Default Timer Gate, 2026-06-26
+
+Attempt: mirror the successful serial-path timing cleanup on the exact condition-direct path by
+disabling per-event dispatcher/worker timers in default runs and only keeping them under deep
+profile.
+
+Result:
+
+- previous condition-direct 16 workers: 54.664s internal / 57.09s wall for 3h
+- timer-gated condition-direct 16 workers: 57.622s internal / 60.01s wall for 3h
+- correctness: current and V1 summaries still matched the exact baseline
+- CPU utilization remained poor: 175%
+- context switches stayed very high: ~5.33M
+
+Reason: condition-direct is not primarily timer-bound. The exact route is dominated by the
+single-dispatcher plus channel/batch shape and worker waiting/coordination overhead. Removing timers
+does not turn it into a viable runtime path.
+
+Status: rejected and reverted.
+
 ## Rejected Probe: Condition-Direct Channels, 2026-06-26
 
 Probe: rerun the existing exact condition-direct dispatcher on the latest code with 16 condition
