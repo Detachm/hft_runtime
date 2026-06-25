@@ -382,6 +382,48 @@ wall time got worse. This is below the noise floor at best and negative in this 
 
 Status: reverted, not committed.
 
+## Iteration 8 Result, 2026-06-26
+
+Change: in the ignored private comparator's compact typed main path, call strategy book handlers
+with the freshly constructed `StreamBook` after applying it to `MarketState`, instead of inserting
+the book into `MarketState` and immediately looking it up again by asset key. State visibility is
+unchanged: `MarketState::apply_stream_book` still runs before `on_book_event`.
+
+Status:
+
+- Correctness: serial 3h golden hashes matched all four expected hashes.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Code path is private-only under ignored `hft_private/`; the public repo records the result here
+  but cannot track the private diff.
+
+Default compact typed serial run:
+
+- iteration 7 serial: 36.677s / 3h
+- iteration 8 serial: 34.260s / 3h
+- linear 7d estimate: 32.0 min
+- linear 30d estimate: 2.28 h
+
+Default compact typed symbol-parallel run:
+
+- iteration 7 symbol-parallel: 24.603s / 3h
+- iteration 8 symbol-parallel: 23.954s / 3h
+- improvement vs iteration 7: 0.649s / 3h, 2.6%
+- linear 7d estimate: 22.4 min
+- linear 30d estimate: 1.60 h
+
+Deep profile, symbol-parallel:
+
+- elapsed: 28.751s -> 28.171s / 3h
+- `latest_book_lookup_ns`: 0.490s -> 0.000s
+- `callback_total_ns`: 25.732s -> 23.502s
+- `apply_raw_update_ns`: 14.979s -> 11.350s
+- `on_book_event_ns`: 5.821s -> 4.737s
+- `v1_on_book_event_ns`: 4.012s -> 3.905s
+
+Conclusion: avoiding the write-then-readback pattern is a real exact-path improvement. It is still
+a constant-factor win, not the required order-of-magnitude jump. BTC remains the wall-clock limiter:
+after this change BTC deep-mode wall is 27.366s for 3h, while ETH/SOL finish much earlier.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
