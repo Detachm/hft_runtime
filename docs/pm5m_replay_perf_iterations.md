@@ -367,6 +367,21 @@ dominates the wall clock. The remaining path to a 5-minute 7d replay is not more
 micro-optimization; it requires exact BTC-internal parallelism or a materially different callback
 state layout.
 
+## Rejected Attempt: Compact Heap Key `Rc<str>`, 2026-06-26
+
+Attempt: replace the compact heap key's `Arc<str>` fields with `Rc<str>`, since the pending heap is
+thread-local and does not need atomic reference counts.
+
+Result:
+
+- previous `Arc<str>` symbol-parallel default: 24.603s / 3h
+- `Rc<str>` symbol-parallel default: 25.138s / 3h
+
+Reason: the theoretical atomic-count saving did not appear in end-to-end runtime; total callback and
+wall time got worse. This is below the noise floor at best and negative in this run.
+
+Status: reverted, not committed.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
