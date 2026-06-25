@@ -474,3 +474,54 @@ Reason: repeated symbol/outcome lookup is not the limiting cost; the remaining V
 actual decision/sweep/cache work and surrounding event flow.
 
 Status: reverted.
+
+## Iteration 9 Result: Disable Default Per-Event Timers, 2026-06-26
+
+Change: in the ignored private comparator's compact typed path, keep detailed stage timers behind
+`PM5M_MARKET_REPLAY_DEEP_PROFILE=1`. Default production-speed runs still report wall time and
+high-level counters, but no longer call `Instant::now()` around every update/book/strategy stage.
+
+Status:
+
+- Correctness: serial 3h golden hashes matched all four expected hashes.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Code path is private-only under ignored `hft_private/`; the public repo records the result here
+  but cannot track the private diff.
+
+Default compact typed symbol-parallel run:
+
+- iteration 8 symbol-parallel: 23.954s / 3h
+- iteration 9 symbol-parallel: 18.763s / 3h
+- improvement vs iteration 8: 5.191s / 3h, 21.7%
+- linear 7d estimate: 17.5 min
+- linear 30d estimate: 1.25 h
+
+Default compact typed serial run:
+
+- iteration 8 serial: 34.260s / 3h
+- iteration 9 serial: 26.497s / 3h
+- linear 7d estimate: 24.7 min
+- linear 30d estimate: 1.77 h
+
+Deep profile, symbol-parallel:
+
+- elapsed: 28.171s -> 27.806s / 3h
+- BTC shard wall: 27.039s; ETH: 6.315s; SOL: 4.735s
+- total callbacks: 14.823M typed updates; 21.317M changed book rows
+- top BTC buckets:
+  - raw stream excluding callback: 9.961s
+  - apply update / state maintenance: 8.100s
+  - BookRow build: 4.595s
+  - on-book strategy event: 3.471s
+  - typed stream merge/flush: 3.191s
+  - compact record decode: 2.836s
+  - V1 on-book event: 2.871s
+  - replay state apply: 1.548s
+  - process references: 1.014s
+  - execute due: 0.980s
+
+Conclusion: earlier default timings were polluted by profiling overhead. The real production path is
+now faster, but still not close to the 7-day under-5-minute target. The wall clock is dominated by
+the BTC shard, so symbol-level parallelism has largely hit its ceiling for the current 3-symbol
+workload. The remaining first-order problem is exact parallelism inside BTC, not more timers or small
+lookup caches.
