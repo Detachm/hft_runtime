@@ -279,6 +279,56 @@ ordered heap merge. To reach 7d under 5 minutes, the next material step still ha
 independent market work without a central per-update dispatcher and without resetting strategy
 state incorrectly.
 
+## Rejected Attempt: Residual Fast Path, 2026-06-26
+
+Attempt: skip `StreamingMarketReplayState::residual_asks.remove()` when the residual map is empty,
+and avoid the condition observer call when condition tracking is disabled.
+
+Result:
+
+- previous symbol-parallel default: 24.968s / 3h
+- residual fast-path symbol-parallel default: 25.335s / 3h
+- `replay_state_apply_ns`: 2.212s -> 2.176s, but total wall and surrounding callback buckets got
+  worse
+
+Reason: this did reduce a tiny part of replay-state apply, but not enough to survive normal run
+variance; it also did not address the larger BookRow/callback/merge costs.
+
+Status: reverted, not committed.
+
+## Iteration 6 Result, 2026-06-26
+
+Change: in the ignored private comparator, replace `levels_from_book`'s per-call
+`Box<dyn Iterator>` with static bid/ask iterator branches. The generated top-10 level arrays are
+unchanged: bids still iterate descending, asks ascending, and only positive quantities are emitted.
+
+Status:
+
+- Correctness: serial 3h golden hashes matched all four expected hashes.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Code path is private-only under ignored `hft_private/`; the public repo can only record this
+  iteration unless that ownership boundary changes.
+
+Default compact typed symbol-parallel run:
+
+- iteration 5 symbol-parallel: 24.968s / 3h
+- iteration 6 symbol-parallel: 24.748s / 3h
+- improvement vs iteration 5: 0.220s / 3h, 0.9%
+- linear 7d estimate: 23.1 min
+- linear 30d estimate: 1.65 h
+
+Deep profile, symbol-parallel:
+
+- elapsed: 30.519s -> 29.797s / 3h
+- `stream_book_levels_ns`: 1.499s -> 1.062s
+- `book_row_build_ns`: 6.059s -> 5.720s
+- `apply_raw_update_ns`: 14.207s -> 13.958s
+
+Conclusion: the change is correct and cheap, but it is only a small constant-factor win. The profile
+now says further micro-optimizing level extraction will not close the gap. The dominant unsolved
+problem remains BTC being a single exact replay stream with callback/apply/on-book work running
+mostly serially.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
