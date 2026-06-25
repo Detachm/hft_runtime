@@ -108,3 +108,83 @@ Deep profile:
 Next target: reduce `affected_assets`/`replay_state_apply`/BookRow construction by avoiding owned
 asset-id sets and repeated string-key lookups in the hot path, while preserving exact update order
 and hash output.
+
+## Iteration 2 Result, 2026-06-26
+
+Change: replace the private runner's per-update `BTreeSet<String>` affected-asset collection with
+borrowed asset-id references. Single-asset updates take the zero-allocation path. Multi-asset updates
+still sort and deduplicate borrowed `&str` values, preserving the old `BTreeSet` iteration order and
+therefore preserving event/hash ordering.
+
+Status:
+
+- Correctness: 3h golden hashes matched all four expected hashes.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Code path is still in ignored `hft_private/`.
+
+Default compact typed serial run:
+
+- iteration 1: 44.932s / 3h
+- iteration 2: 40.782s / 3h
+- improvement vs iteration 1: 4.150s / 3h, 9.2%
+- improvement vs baseline: 6.011s / 3h, 12.8%
+- linear 7d estimate: 38.1 min
+- linear 30d estimate: 2.72 h
+
+Deep profile:
+
+- elapsed: 47.210s / 3h
+- `affected_assets_ns`: 2.093s -> 1.166s
+- `apply_raw_update_ns`: 21.018s -> 18.151s
+- largest remaining buckets:
+  - callback total: 29.289s
+  - apply update / state maintenance: 18.151s
+  - on-book strategy event: 6.430s
+  - BookRow build: 6.321s
+  - typed stream merge/flush: 5.928s
+  - compact segment read: 5.200s
+  - replay state apply: 4.926s
+  - V1 on-book event: 4.736s
+  - compact record decode: 4.455s
+
+## Iteration 3 Result, 2026-06-26
+
+Change: add `StreamingMarketReplayState::new_without_condition_tracking()` in public
+`pm5m_market_cache`. Default state construction still tracks conditions. The private strategy
+comparator uses the lighter state because exact current/V1 replay only needs latest books by asset;
+condition summaries are already derived from intents/fills/settlements outside the streaming state.
+
+Status:
+
+- Correctness: 3h golden hashes matched all four expected hashes.
+- Public tests: `cargo test --workspace` passed.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Public code is commit-ready; private runner call remains under ignored `hft_private/`.
+
+Default compact typed serial run:
+
+- iteration 2: 40.782s / 3h
+- iteration 3: 38.597s / 3h
+- improvement vs iteration 2: 2.185s / 3h, 5.4%
+- improvement vs baseline: 8.196s / 3h, 17.5%
+- linear 7d estimate: 36.0 min
+- linear 30d estimate: 2.57 h
+
+Deep profile:
+
+- elapsed: 43.562s / 3h
+- `replay_state_apply_ns`: 4.926s -> 2.612s
+- `apply_raw_update_ns`: 18.151s -> 15.452s
+- largest remaining buckets:
+  - callback total: 26.216s
+  - apply update / state maintenance: 15.452s
+  - on-book strategy event: 6.205s
+  - BookRow build: 6.130s
+  - typed stream merge/flush: 5.750s
+  - compact segment read: 5.062s
+  - V1 on-book event: 4.543s
+  - compact record decode: 4.329s
+
+Next target: remove the single-threaded global heap/merge tax by partitioning independent market
+streams, or reduce V1/on-book work by avoiding repeated string/interner lookups in the strategy hot
+path. The current single-thread path still linearly extrapolates far above the 5-minute 7d target.

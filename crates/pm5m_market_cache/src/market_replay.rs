@@ -691,7 +691,7 @@ struct ResidualReplayBook {
     asks: BTreeMap<i64, i64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamingMarketReplayState {
     books: BTreeMap<String, ReplayBookState>,
     references: BTreeMap<String, ReplayReferenceState>,
@@ -700,11 +700,34 @@ pub struct StreamingMarketReplayState {
     pending_buy_orders: Vec<PendingReplayBuyOrder>,
     residual_asks: BTreeMap<String, ResidualReplayBook>,
     applied_events: u64,
+    track_conditions: bool,
+}
+
+impl Default for StreamingMarketReplayState {
+    fn default() -> Self {
+        Self {
+            books: BTreeMap::new(),
+            references: BTreeMap::new(),
+            conditions: BTreeMap::new(),
+            settlements_by_condition_outcome: BTreeMap::new(),
+            pending_buy_orders: Vec::new(),
+            residual_asks: BTreeMap::new(),
+            applied_events: 0,
+            track_conditions: true,
+        }
+    }
 }
 
 impl StreamingMarketReplayState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_without_condition_tracking() -> Self {
+        Self {
+            track_conditions: false,
+            ..Self::default()
+        }
     }
 
     pub fn apply_event(&mut self, event: &MarketEvent) -> Result<()> {
@@ -781,6 +804,9 @@ impl StreamingMarketReplayState {
     }
 
     fn observe_condition_from_event(&mut self, event: &MarketEvent) {
+        if !self.track_conditions {
+            return;
+        }
         let Some(condition_id) = event.condition_id.as_ref() else {
             return;
         };
@@ -926,6 +952,9 @@ impl StreamingMarketReplayState {
         update: &MarketReplayTypedUpdate,
         asset_id: Option<&str>,
     ) {
+        if !self.track_conditions {
+            return;
+        }
         let Some(condition_id) = update.condition_id.as_ref() else {
             return;
         };
