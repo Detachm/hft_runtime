@@ -18,8 +18,7 @@ use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::mpsc;
-use std::sync::OnceLock;
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Instant;
 
 const HOUR_NS: i64 = 3_600_000_000_000;
@@ -599,8 +598,20 @@ struct CompactTypedRecordMeta {
 
 #[derive(Debug, Clone)]
 struct OrderedCompactTypedUpdate {
-    key: MarketEventSortKey,
+    key: CompactTypedSortKey,
     update: MarketReplayTypedUpdate,
+}
+
+#[derive(Debug, Clone)]
+struct CompactTypedSortKey {
+    visible_ts_ns: i64,
+    local_recv_ts_ns: i64,
+    ingest_seq: u64,
+    source_segment: Arc<str>,
+    source_row_idx: u64,
+    sequence: u64,
+    asset_id: Arc<str>,
+    event_type_code: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4358,6 +4369,52 @@ impl PartialOrd for OrderedCompactTypedUpdate {
     }
 }
 
+impl Eq for CompactTypedSortKey {}
+
+impl PartialEq for CompactTypedSortKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.visible_ts_ns == other.visible_ts_ns
+            && self.local_recv_ts_ns == other.local_recv_ts_ns
+            && self.ingest_seq == other.ingest_seq
+            && self.source_segment.as_ref() == other.source_segment.as_ref()
+            && self.source_row_idx == other.source_row_idx
+            && self.sequence == other.sequence
+            && self.asset_id.as_ref() == other.asset_id.as_ref()
+            && self.event_type_code == other.event_type_code
+    }
+}
+
+impl Ord for CompactTypedSortKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        (
+            self.visible_ts_ns,
+            self.local_recv_ts_ns,
+            self.ingest_seq,
+            self.source_segment.as_ref(),
+            self.source_row_idx,
+            self.sequence,
+            self.asset_id.as_ref(),
+            self.event_type_code,
+        )
+            .cmp(&(
+                other.visible_ts_ns,
+                other.local_recv_ts_ns,
+                other.ingest_seq,
+                other.source_segment.as_ref(),
+                other.source_row_idx,
+                other.sequence,
+                other.asset_id.as_ref(),
+                other.event_type_code,
+            ))
+    }
+}
+
+impl PartialOrd for CompactTypedSortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 fn write_compact_typed_segment_from_hftrec4_records(
     path: &Path,
     raw_segment_path: &Path,
@@ -4723,7 +4780,19 @@ fn enqueue_compact_typed_segment_records(
     } = sections;
     let record_count = header.record_count as usize;
     profile.selected_record_count = profile.selected_record_count.saturating_add(record_count);
-    let source_segment = header.raw_segment_path.display().to_string();
+    let source_segment = Arc::<str>::from(
+        header
+            .raw_segment_path
+            .display()
+            .to_string()
+            .into_boxed_str(),
+    );
+    let empty_asset_id = Arc::<str>::from("");
+    let key_asset_ids = header
+        .assets
+        .iter()
+        .map(|asset_id| Arc::<str>::from(asset_id.as_str()))
+        .collect::<Vec<_>>();
     let mut filter_ns = 0u128;
     let mut pending_push_ns = 0u128;
     let mut decode_ns = 0u128;
@@ -4793,9 +4862,8 @@ fn enqueue_compact_typed_segment_records(
             optional_compact_dict_str(&header.conditions, meta.condition_key, "condition")?
                 .map(str::to_string);
         let payload_hash = digest_32_bytes_to_hex(&meta.payload_sha256);
-        let key_asset_id = optional_compact_dict_str(&header.assets, meta.key_asset_key, "asset")?
-            .unwrap_or_default()
-            .to_string();
+        let key_asset_id = compact_typed_key_asset_id(&key_asset_ids, meta.key_asset_key)?
+            .unwrap_or_else(|| Arc::clone(&empty_asset_id));
         let update = MarketReplayTypedUpdate {
             schema_version: 1,
             dataset_format: String::new(),
@@ -4818,15 +4886,15 @@ fn enqueue_compact_typed_segment_records(
         }
 
         let push_started = deep_profile.then(Instant::now);
-        let key = MarketEventSortKey {
+        let key = CompactTypedSortKey {
             visible_ts_ns: update.visible_ts_ns,
             local_recv_ts_ns: update.original_local_recv_ts_ns,
             ingest_seq: update.ingest_seq,
-            source_segment: source_segment.clone(),
+            source_segment: Arc::clone(&source_segment),
             source_row_idx: update.source_row_idx,
             sequence: 0,
             asset_id: key_asset_id,
-            event_type: update.event_type.clone(),
+            event_type_code: meta.event_type_code,
         };
         pending.push(Reverse(OrderedCompactTypedUpdate { key, update }));
         profile.selected_update_count = profile.selected_update_count.saturating_add(1);
@@ -5301,6 +5369,17 @@ fn optional_compact_dict_str<'a>(
         return Ok(None);
     }
     required_compact_dict_str(values, key, field).map(Some)
+}
+
+fn compact_typed_key_asset_id(values: &[Arc<str>], key: u32) -> Result<Option<Arc<str>>> {
+    if key == COMPACT_TYPED_NONE_U32 {
+        return Ok(None);
+    }
+    values
+        .get(key as usize)
+        .map(Arc::clone)
+        .map(Some)
+        .ok_or_else(|| anyhow!("compact typed asset key {key} out of range"))
 }
 
 fn required_compact_dict_value(values: &[String], key: u32, field: &str) -> Result<String> {

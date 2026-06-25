@@ -329,6 +329,44 @@ now says further micro-optimizing level extraction will not close the gap. The d
 problem remains BTC being a single exact replay stream with callback/apply/on-book work running
 mostly serially.
 
+## Iteration 7 Result, 2026-06-26
+
+Change: give the compact typed stream its own lighter heap sort key. The old compact path reused
+`MarketEventSortKey`, which cloned `source_segment` and the asset tie-breaker into a `String` for
+every emitted update. The new compact key keeps the same ordering fields and comparison semantics,
+but shares per-segment `source_segment` and per-segment asset dictionary values via `Arc<str>`, and
+uses the compact event type code for the final event-type tie-breaker. Raw replay sorting is
+unchanged.
+
+Status:
+
+- Correctness: serial 3h golden hashes matched all four expected hashes.
+- Public tests: `cargo test -p pm5m_market_cache` passed.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+- Public code committed; the measured runner also includes the private iteration-6 static-levels
+  change.
+
+Default compact typed symbol-parallel run:
+
+- iteration 6 symbol-parallel: 24.748s / 3h
+- iteration 7 symbol-parallel: 24.603s / 3h
+- improvement vs iteration 6: 0.145s / 3h, 0.6%
+- linear 7d estimate: 23.0 min
+- linear 30d estimate: 1.64 h
+
+Deep profile, symbol-parallel:
+
+- elapsed: 29.797s -> 28.751s / 3h
+- `compact_pending_push_ns`: 2.008s -> 0.961s
+- `merge_flush_ns`: 4.999s -> 4.587s
+- `raw_stream_excluding_callback_ns`: 16.069s -> 15.397s
+
+Conclusion: the targeted heap-key allocation cost was real and is now much smaller, but total wall
+only moved slightly because callback/apply/on-book work expanded with run variance and BTC still
+dominates the wall clock. The remaining path to a 5-minute 7d replay is not more string/key
+micro-optimization; it requires exact BTC-internal parallelism or a materially different callback
+state layout.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
