@@ -13,8 +13,9 @@ use market_data_etl_core::{
     sha256_bytes, write_hftrec4_segment, Hftrec4WriteRecord,
 };
 use pm5m_market_cache::{
-    append_book_cache2_partition, AppendBookCache2PartitionOptions, BookCacheRow,
-    CanonicalWsBookReplayer,
+    append_book_cache2_partition, market_replay_compact_typed_output_path,
+    write_market_replay_compact_typed_segment_from_hftrec4_write_records,
+    AppendBookCache2PartitionOptions, BookCacheRow, CanonicalWsBookReplayer,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -48,6 +49,7 @@ pub struct WsRecorderOptions {
     pub endpoint: String,
     pub raw_root: PathBuf,
     pub state_root: PathBuf,
+    pub typed_root: Option<PathBuf>,
     pub book_state_cache_root: Option<PathBuf>,
     pub audit_profile_hash: Option<String>,
     pub raw_format: WsRawFormat,
@@ -86,6 +88,7 @@ impl WsRecorderOptions {
             endpoint: POLYMARKET_CLOB_WS_MARKET_ENDPOINT.to_string(),
             raw_root,
             state_root,
+            typed_root: None,
             book_state_cache_root: None,
             audit_profile_hash: None,
             raw_format: WsRawFormat::Hftrec4,
@@ -265,6 +268,10 @@ pub async fn run_ws_forever(config: RecorderConfig, options: WsRecorderOptions) 
         .with_context(|| format!("create WS raw root {}", options.raw_root.display()))?;
     fs::create_dir_all(&options.state_root)
         .with_context(|| format!("create WS state root {}", options.state_root.display()))?;
+    if let Some(typed_root) = &options.typed_root {
+        fs::create_dir_all(typed_root)
+            .with_context(|| format!("create WS typed root {}", typed_root.display()))?;
+    }
     write_ws_run_manifest(&config, &options)?;
 
     let mut state = read_ws_state(&options.state_root)?;
@@ -760,7 +767,20 @@ fn flush_ws_rows(
     let output_path =
         ws_output_path_for_format(&options.raw_root, segment_start_ts_ns, options.raw_format);
     let flush_started = Instant::now();
-    write_hftrec4_segment(&output_path, &hftrec4_rows(rows)?)?;
+    let hftrec4_rows = hftrec4_rows(rows)?;
+    write_hftrec4_segment(&output_path, &hftrec4_rows)?;
+    let typed_row_count = if let Some(typed_root) = &options.typed_root {
+        let typed_path = market_replay_compact_typed_output_path(typed_root, segment_start_ts_ns);
+        write_market_replay_compact_typed_segment_from_hftrec4_write_records(
+            &typed_path,
+            &output_path,
+            &hftrec4_rows,
+        )?
+        .map(|manifest| manifest.record_count)
+        .unwrap_or(0)
+    } else {
+        0
+    };
     let elapsed_ms = flush_started.elapsed().as_millis();
     let row_count = rows.len();
     let bytes = *payload_bytes;
@@ -798,9 +818,10 @@ fn flush_ws_rows(
         .map(|ts| ((now_unix_ns() as i64).saturating_sub(ts) / 1_000_000).max(0))
         .unwrap_or(-1);
     eprintln!(
-        "pm5m-recorder ws flush rows={} bytes={} cache_book_rows={} raw_format={:?} elapsed_ms={} last_recv_age_ms={} connection_id={} subscription_assets={}",
+        "pm5m-recorder ws flush rows={} bytes={} typed_rows={} cache_book_rows={} raw_format={:?} elapsed_ms={} last_recv_age_ms={} connection_id={} subscription_assets={}",
         row_count,
         bytes,
+        typed_row_count,
         cache_book_row_count,
         options.raw_format,
         elapsed_ms,
@@ -1463,6 +1484,15 @@ pub fn ws_hftrec4_output_path(raw_root: &Path, ts_ns: i64) -> PathBuf {
 }
 
 fn write_ws_run_manifest(config: &RecorderConfig, options: &WsRecorderOptions) -> Result<()> {
+    let mut outputs = vec![
+        "recorder_state.json".to_string(),
+        RECORDER_HEALTH_STREAM.to_string(),
+        "market_metadata_snapshots.jsonl".to_string(),
+        RAW_POLYMARKET_CLOB_WS_STREAM.to_string(),
+    ];
+    if options.typed_root.is_some() {
+        outputs.push("polymarket_clob_ws_typed".to_string());
+    }
     let manifest = RecorderRunManifest {
         schema_version: 1,
         dataset_format: RECORDER_RUN_MANIFEST_FORMAT.to_string(),
@@ -1470,11 +1500,13 @@ fn write_ws_run_manifest(config: &RecorderConfig, options: &WsRecorderOptions) -
         local_start_ts_ns: now_unix_ns() as i64,
         raw_root: options.raw_root.clone(),
         state_root: options.state_root.clone(),
+        typed_root: options.typed_root.clone(),
         audit_profile_hash: options.audit_profile_hash.clone(),
         config_hash: Some(hash_serializable(&json!({
             "config": config,
             "endpoint": options.endpoint,
             "raw_format": format!("{:?}", options.raw_format),
+            "typed_root": options.typed_root.clone(),
             "book_state_cache_root": options.book_state_cache_root,
             "flush_interval_ms": options.flush_policy.interval.as_millis(),
             "flush_bytes": options.flush_policy.max_payload_bytes,
@@ -1485,12 +1517,7 @@ fn write_ws_run_manifest(config: &RecorderConfig, options: &WsRecorderOptions) -
         host: current_host(),
         command_line: command_line(),
         alignment_policy: Some(RecorderAlignmentPolicy::live_replay_default()),
-        outputs: vec![
-            "recorder_state.json".to_string(),
-            RECORDER_HEALTH_STREAM.to_string(),
-            "market_metadata_snapshots.jsonl".to_string(),
-            RAW_POLYMARKET_CLOB_WS_STREAM.to_string(),
-        ],
+        outputs,
     };
     let bytes = serde_json::to_vec_pretty(&manifest)?;
     atomic_write_verified(
@@ -1586,6 +1613,21 @@ fn validate_ws_inputs(config: &RecorderConfig, options: &WsRecorderOptions) -> R
     }
     if options.raw_root == options.state_root {
         bail!("WS raw_root and state_root must be different");
+    }
+    if let Some(typed_root) = &options.typed_root {
+        if typed_root.as_os_str().is_empty() {
+            bail!("WS typed_root must not be empty when set");
+        }
+        if typed_root == &options.raw_root || typed_root == &options.state_root {
+            bail!("WS typed_root must be different from raw_root and state_root");
+        }
+        if options
+            .book_state_cache_root
+            .as_ref()
+            .is_some_and(|cache_root| cache_root == typed_root)
+        {
+            bail!("WS typed_root and book_state_cache_root must be different");
+        }
     }
     if !(options.endpoint.starts_with("ws://") || options.endpoint.starts_with("wss://")) {
         bail!("WS endpoint must be ws/wss URL");
@@ -1821,12 +1863,15 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let raw_root = temp.path().join("raw");
         let state_root = temp.path().join("state");
+        let typed_root = temp.path().join("typed");
         fs::create_dir_all(&raw_root).unwrap();
         fs::create_dir_all(&state_root).unwrap();
+        fs::create_dir_all(&typed_root).unwrap();
         let options = WsRecorderOptions {
             endpoint,
             raw_root: raw_root.clone(),
             state_root: state_root.clone(),
+            typed_root: Some(typed_root.clone()),
             book_state_cache_root: None,
             audit_profile_hash: None,
             raw_format: WsRawFormat::Hftrec4,
@@ -1895,6 +1940,21 @@ mod tests {
         assert_eq!(rows[2].asset_id.as_deref(), Some("asset-yes"));
         assert_eq!(rows[2].condition_id.as_deref(), Some("cond-btc"));
         assert!(String::from_utf8_lossy(&rows[2].payload).contains("1757908892351"));
+        let typed_files = pm5m_market_cache::discover_market_replay_compact_typed_files_for_window(
+            &typed_root,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(typed_files.len(), 1);
+        let typed_rows =
+            pm5m_market_cache::read_market_replay_compact_typed_records(&typed_files[0]).unwrap();
+        assert_eq!(typed_rows.len(), 1);
+        assert_eq!(typed_rows[0].update.event_type, "book");
+        assert_eq!(
+            typed_rows[0].update.condition_id.as_deref(),
+            Some("cond-btc")
+        );
         let saved_state = read_ws_state(&state_root).unwrap();
         assert_eq!(saved_state.next_ingest_seq, 3);
     }

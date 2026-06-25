@@ -1,5 +1,11 @@
 # PM5M Backtest Architecture
 
+Status note, 2026-06-24 CST: this document describes the compact-cache architecture that existed
+before the replay ETL refactor decision. For the current target architecture and implementation
+order, use `docs/pm5m_replay_etl_refactor_plan.md`. In that plan, `HFTBOOK2/HFTIDX1` are retained as
+the optional `Depth State Store / Replay State Index` path, not the default live-comparison or
+large-window research path.
+
 This document describes the current backtest architecture after the compact-cache cutover.
 
 ## Goal

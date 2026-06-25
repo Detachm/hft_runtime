@@ -2,6 +2,10 @@ use crate::hftbook2::{
     write_book_cache2_catalog, write_book_cache2_partition_batch, BookCache2Partition,
     WriteBookCache2Options,
 };
+use crate::market_replay::{
+    apply_poly_visible_time_model, asset_id_from_payload, condition_id_from_payload,
+    hftrec4_record_to_ws_raw,
+};
 use crate::replay::CanonicalWsBookReplayer;
 use crate::types::{
     canonical_market_symbol, BookCacheRow, RawPolymarketClobWsEvent, BOOK_CACHE2_CATALOG,
@@ -185,7 +189,12 @@ pub fn build_book_cache(options: &BuildBookCacheOptions) -> Result<BookCacheBuil
                 if raw_symbol_disallowed(&raw, &symbol_filter) {
                     return Ok(());
                 }
-                apply_poly_visible_time_model(&mut raw, options);
+                apply_poly_visible_time_model(
+                    &mut raw,
+                    options.poly_server_visible_time,
+                    options.poly_incremental_latency_ms,
+                    options.poly_incremental_freshness_guard_ms,
+                );
                 for row in replayer.apply(raw)? {
                     if ts_in_window(row.local_recv_ts_ns, options)
                         && symbol_filter.allows(&row.symbol)
@@ -413,34 +422,6 @@ fn build_hftrec4_ws_book_cache_parallel(
     write_book_cache2_catalog(write_options, partitions)
 }
 
-fn hftrec4_record_to_ws_raw(
-    record: market_data_etl_core::Hftrec4Record,
-) -> RawPolymarketClobWsEvent {
-    let outcome = infer_outcome_from_assets(
-        record.asset_id.as_deref(),
-        record.yes_asset_id.as_deref(),
-        record.no_asset_id.as_deref(),
-    );
-    RawPolymarketClobWsEvent {
-        source_id: WS_RAW_STREAM.to_string(),
-        ingest_seq_scope: WS_RAW_STREAM.to_string(),
-        ingest_seq: record.ingest_seq,
-        local_recv_ts_ns: record.local_recv_ts_ns,
-        asset_id: record.asset_id,
-        condition_id: record.condition_id,
-        symbol: record.symbol,
-        outcome,
-        market_start_ts_ns: record.market_start_ts_ns,
-        market_end_ts_ns: record.market_end_ts_ns,
-        yes_asset_id: record.yes_asset_id,
-        no_asset_id: record.no_asset_id,
-        event_type: record.event_type,
-        exchange_ts_ms: None,
-        raw_payload_sha256: record.payload_sha256,
-        raw_payload: record.payload,
-    }
-}
-
 fn build_condition_allowlist(
     manifests: &[RawCandidateManifest],
     options: &BuildBookCacheOptions,
@@ -597,7 +578,12 @@ fn scan_manifest_chunk_parallel(
         if raw_symbol_disallowed(&raw, symbol_filter) {
             continue;
         }
-        apply_poly_visible_time_model(&mut raw, options);
+        apply_poly_visible_time_model(
+            &mut raw,
+            options.poly_server_visible_time,
+            options.poly_incremental_latency_ms,
+            options.poly_incremental_freshness_guard_ms,
+        );
         let Some(condition_id) = raw.condition_id.as_deref() else {
             continue;
         };
@@ -616,68 +602,6 @@ fn scan_manifest_chunk_parallel(
         shard.sort_by(raw_ws_condition_order);
     }
     Ok(shards)
-}
-
-fn apply_poly_visible_time_model(
-    raw: &mut RawPolymarketClobWsEvent,
-    options: &BuildBookCacheOptions,
-) {
-    if !options.poly_server_visible_time {
-        return;
-    }
-    if !raw.event_type.eq_ignore_ascii_case("price_change") {
-        return;
-    }
-    let Some(exchange_ts_ms) = raw
-        .exchange_ts_ms
-        .or_else(|| timestamp_ms_for_raw_payload(&raw.raw_payload))
-    else {
-        return;
-    };
-    raw.exchange_ts_ms = Some(exchange_ts_ms);
-    let Some(synthetic_ts_ns) = exchange_ts_ms
-        .checked_add(options.poly_incremental_latency_ms)
-        .and_then(|ts_ms| ts_ms.checked_mul(1_000_000))
-    else {
-        return;
-    };
-    let original_recv_ts_ns = raw.local_recv_ts_ns;
-    if synthetic_ts_ns > original_recv_ts_ns {
-        return;
-    }
-    let guard_ns = options
-        .poly_incremental_freshness_guard_ms
-        .saturating_mul(1_000_000);
-    if original_recv_ts_ns.saturating_sub(synthetic_ts_ns) <= guard_ns {
-        raw.local_recv_ts_ns = synthetic_ts_ns;
-    }
-}
-
-fn timestamp_ms_for_raw_payload(raw_payload: &[u8]) -> Option<i64> {
-    let value = serde_json::from_slice::<Value>(raw_payload).ok()?;
-    for key in ["timestamp", "ts", "time", "exchange_ts_ms"] {
-        let Some(field) = value.get(key) else {
-            continue;
-        };
-        if let Some(raw) = field.as_i64() {
-            return Some(normalize_exchange_ts_ms(raw));
-        }
-        if let Some(raw) = field.as_u64().and_then(|raw| i64::try_from(raw).ok()) {
-            return Some(normalize_exchange_ts_ms(raw));
-        }
-        if let Some(raw) = field.as_str().and_then(|raw| raw.parse::<i64>().ok()) {
-            return Some(normalize_exchange_ts_ms(raw));
-        }
-    }
-    None
-}
-
-fn normalize_exchange_ts_ms(raw: i64) -> i64 {
-    if raw < 10_000_000_000_000 {
-        raw
-    } else {
-        raw / 1_000_000
-    }
 }
 
 fn segment_may_contain_allowed_condition(
@@ -777,21 +701,6 @@ fn raw_ws_condition_order(
         ))
 }
 
-fn infer_outcome_from_assets(
-    asset_id: Option<&str>,
-    yes_asset_id: Option<&str>,
-    no_asset_id: Option<&str>,
-) -> Option<String> {
-    let asset_id = asset_id?;
-    if yes_asset_id.is_some_and(|yes_asset_id| yes_asset_id == asset_id) {
-        return Some("YES".to_string());
-    }
-    if no_asset_id.is_some_and(|no_asset_id| no_asset_id == asset_id) {
-        return Some("NO".to_string());
-    }
-    None
-}
-
 fn meta_symbol_disallowed(record: &Hftrec4RecordMeta, symbol_filter: &SymbolFilter) -> bool {
     record
         .symbol
@@ -840,40 +749,6 @@ fn raw_symbol_disallowed(raw: &RawPolymarketClobWsEvent, symbol_filter: &SymbolF
         .as_deref()
         .and_then(canonical_market_symbol)
         .is_some_and(|symbol| !symbol_filter.allows(&symbol))
-}
-
-fn condition_id_from_payload(payload: &[u8]) -> Option<String> {
-    string_from_payload(payload, &["condition_id", "conditionId", "market"])
-}
-
-fn asset_id_from_payload(payload: &[u8]) -> Option<String> {
-    string_from_payload(
-        payload,
-        &["asset_id", "assetId", "asset", "token_id", "tokenId"],
-    )
-    .or_else(|| {
-        let value = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
-        value
-            .get("price_changes")
-            .or_else(|| value.get("changes"))?
-            .as_array()?
-            .iter()
-            .find_map(|change| {
-                ["asset_id", "assetId", "asset", "token_id", "tokenId"]
-                    .iter()
-                    .find_map(|field| change.get(*field)?.as_str().map(str::to_string))
-            })
-    })
-}
-
-fn string_from_payload(payload: &[u8], fields: &[&str]) -> Option<String> {
-    if payload.is_empty() {
-        return None;
-    }
-    let value = serde_json::from_slice::<serde_json::Value>(payload).ok()?;
-    fields
-        .iter()
-        .find_map(|field| value.get(*field)?.as_str().map(str::to_string))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

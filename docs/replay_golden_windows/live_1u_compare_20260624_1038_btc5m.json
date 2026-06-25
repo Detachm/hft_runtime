@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "artifact_id": "live_1u_compare_20260624_1038_btc5m_market_replay_golden_v1",
+  "created_cst": "2026-06-24T14:00:00+08:00",
+  "purpose": "Phase 0 golden window for validating Market Replay live-order fillability semantics before Phase 3 full strategy replay.",
+  "market_replay_semantics_id": "pm5m_market_replay_semantics_v1",
+  "fill_model_id": "delayed_fak_residual_visible_ask_v1",
+  "fee_model_id": "zero_fee_v1",
+  "settlement_model_id": "official_polymarket_labels_v1",
+  "poly_visible_time": {
+    "poly_server_visible_time": true,
+    "poly_incremental_latency_ms": 20,
+    "poly_incremental_freshness_guard_ms": 500
+  },
+  "reference_visible_time": {
+    "reference_latency_ms": 200
+  },
+  "submit_latency_ms": 300,
+  "window": {
+    "start_cst": "2026-06-23T13:26:58.046372+08:00",
+    "end_cst": "2026-06-24T10:38:00+08:00",
+    "live_start_ts_ns": 1782192418046372180,
+    "cutoff_ts_ns": 1782268680000000000,
+    "smoke_raw_start_ts_ns": 1782193100000000000,
+    "smoke_raw_end_ts_ns": 1782193380000000000
+  },
+  "strategy_config_snapshots": [
+    {
+      "role": "live_runtime_multi_strategy",
+      "path": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/live_config.real.json",
+      "sha256": "572c97a04d1b4fef007346c3a316393193beeea55d1c3976d26fd1b945462502"
+    },
+    {
+      "role": "current_position_v4_edge_eth_gray_1u",
+      "path": "hft_private/configs/position_v4_edge_live_eth_gray_20260620.json",
+      "sha256": "4a4466c7553e670855f29ffce3b1e5109d4c41a964206beb149568605055e21d"
+    },
+    {
+      "role": "current_position_v4_edge_default_live",
+      "path": "hft_private/configs/position_v4_edge_live.json",
+      "sha256": "d8aa78791b35bae2cfee620f055d5b0157f76507e838b7cffff716f4fcf8cf5d"
+    },
+    {
+      "role": "v1_frozen_edge_hold_default",
+      "path": "hft_private/configs/frozen_edge_hold_v1_default_20260624.json",
+      "sha256": "9ef190abb0edc2fd8ad3b58cf0132ca34caf7103ab5ed0603ed8dd4f6625bd4a"
+    }
+  ],
+  "inputs": {
+    "raw_root": "/mnt/data/hft/hft_runtime/pm5m_recorder_prod/poly_btc_5m_15m/raw",
+    "settlement_cache_root": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/chunks/chunk_00/settlement_hftsettle1",
+    "order_audit": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/live_remote/order_audit.jsonl.zst",
+    "order_audit_note": "The copied active-run zstd file has a truncated tail; the reader intentionally tolerates the incomplete final frame and records the path in the summary."
+  },
+  "live_actual_stable_metrics": {
+    "source": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/live_actual_summary.txt",
+    "sha256": "8cfa110ee7b398dc1aafd04a7f4417ab177fdbaa0f884bc59b78246709b1732c",
+    "order_audit_rows": 5284,
+    "fills_total_orders": 694,
+    "fills_total_conditions": 258,
+    "fills_total_cash": "695.511573",
+    "fills_total_shares": "1237.360203",
+    "settled_total_markets": 255,
+    "settled_total_wins": 158,
+    "settled_total_fills": 686,
+    "settled_total_cash": "687.511583",
+    "settled_total_payout": "669.917428",
+    "settled_total_realized_pnl": "-17.594155",
+    "open_cash_est": "7.999990"
+  },
+  "market_replay_btc5m_smoke_command": [
+    "hft_private/target/release/pm5m_backtest",
+    "market-replay-live-compare",
+    "--raw-root",
+    "/mnt/data/hft/hft_runtime/pm5m_recorder_prod/poly_btc_5m_15m/raw",
+    "--raw-start-ts-ns",
+    "1782193100000000000",
+    "--raw-end-ts-ns",
+    "1782193380000000000",
+    "--market-symbol",
+    "BTC-5M",
+    "--poly-server-visible-time",
+    "--settlement-cache-root",
+    "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/chunks/chunk_00/settlement_hftsettle1",
+    "--output-dir",
+    "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/market_replay_live_compare_smoke_btc5m_target_filtered_v3",
+    "--order-audit",
+    "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/live_remote/order_audit.jsonl.zst",
+    "--default-latency-ms",
+    "300"
+  ],
+  "market_replay_btc5m_smoke_stable_metrics": {
+    "summary_path": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/market_replay_live_compare_smoke_btc5m_target_filtered_v3/market_replay_live_compare_summary.json",
+    "orders_path": "/mnt/data/hft/hft_runtime/analysis_runs/live_1u_compare_20260624_1038/market_replay_live_compare_smoke_btc5m_target_filtered_v3/market_replay_live_compare_orders.jsonl",
+    "orders_sha256": "00c5d096440d566454aa45c37180f44503349bb736a49263f5433a3408f0b45e",
+    "comparable_orders": 4,
+    "skipped_orders": 5280,
+    "replay_event_count": 363648,
+    "applied_market_events": 257985,
+    "final_book_count": 2,
+    "first_market_event_ts_ns": 1782193100000000000,
+    "last_market_event_ts_ns": 1782193364878913014,
+    "live_filled_orders": 3,
+    "replay_filled_orders": 3,
+    "live_cash_micros": 3000000,
+    "replay_cash_micros": 3000000,
+    "live_qty_micros": 4687500,
+    "replay_qty_micros": 4687500,
+    "filled_agree": 3,
+    "unfilled_agree": 1,
+    "live_filled_replay_unfilled": 0,
+    "live_unfilled_replay_filled": 0
+  }
+}

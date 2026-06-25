@@ -20,6 +20,7 @@ case "${ROLE}" in
     CONFIG="${CONFIG:-${ROOT_DIR}/configs/pm5m-recorder-poly-btc-5m-15m.json}"
     RAW_ROOT="${RAW_ROOT:-${DATA_ROOT}/poly_btc_5m_15m/raw}"
     STATE_ROOT="${STATE_ROOT:-${DATA_ROOT}/poly_btc_5m_15m/state}"
+    TYPED_ROOT="${TYPED_ROOT:-${DATA_ROOT}/poly_btc_5m_15m/typed}"
     LOG_DIR="${LOG_DIR:-${DATA_ROOT}/poly_btc_5m_15m/logs}"
     SYMBOL_ARGS=(--symbol BTC --interval 5m --interval 15m)
     MODE="poly"
@@ -28,6 +29,7 @@ case "${ROLE}" in
     CONFIG="${CONFIG:-${ROOT_DIR}/configs/pm5m-recorder-poly-eth-5m-15m.json}"
     RAW_ROOT="${RAW_ROOT:-${DATA_ROOT}/poly_eth_5m_15m/raw}"
     STATE_ROOT="${STATE_ROOT:-${DATA_ROOT}/poly_eth_5m_15m/state}"
+    TYPED_ROOT="${TYPED_ROOT:-${DATA_ROOT}/poly_eth_5m_15m/typed}"
     LOG_DIR="${LOG_DIR:-${DATA_ROOT}/poly_eth_5m_15m/logs}"
     SYMBOL_ARGS=(--symbol ETH --interval 5m --interval 15m)
     MODE="poly"
@@ -36,6 +38,7 @@ case "${ROLE}" in
     CONFIG="${CONFIG:-${ROOT_DIR}/configs/pm5m-recorder-poly-sol-5m-15m.json}"
     RAW_ROOT="${RAW_ROOT:-${DATA_ROOT}/poly_sol_5m_15m/raw}"
     STATE_ROOT="${STATE_ROOT:-${DATA_ROOT}/poly_sol_5m_15m/state}"
+    TYPED_ROOT="${TYPED_ROOT:-${DATA_ROOT}/poly_sol_5m_15m/typed}"
     LOG_DIR="${LOG_DIR:-${DATA_ROOT}/poly_sol_5m_15m/logs}"
     SYMBOL_ARGS=(--symbol SOL --interval 5m --interval 15m)
     MODE="poly"
@@ -52,7 +55,11 @@ case "${ROLE}" in
     ;;
 esac
 
-mkdir -p "${RAW_ROOT}" "${STATE_ROOT}" "${LOG_DIR}"
+if [[ "${MODE}" == "poly" ]]; then
+  mkdir -p "${RAW_ROOT}" "${STATE_ROOT}" "${TYPED_ROOT}" "${LOG_DIR}"
+else
+  mkdir -p "${RAW_ROOT}" "${STATE_ROOT}" "${LOG_DIR}"
+fi
 echo "$$" > "${LOG_DIR}/supervisor.pid"
 
 if [[ -n "${RECORDER_BIN:-}" ]]; then
@@ -62,7 +69,7 @@ else
 fi
 
 while true; do
-  echo "$(date -Is) starting pm5m-recorder role=${ROLE} raw=${RAW_ROOT} state=${STATE_ROOT}" \
+  echo "$(date -Is) starting pm5m-recorder role=${ROLE} raw=${RAW_ROOT} state=${STATE_ROOT} typed=${TYPED_ROOT:-}" \
     | tee -a "${LOG_DIR}/supervisor.log"
 
   if [[ "${MODE}" == "poly" ]]; then
@@ -70,6 +77,7 @@ while true; do
       --config "${CONFIG}" \
       --raw-root "${RAW_ROOT}" \
       --state-root "${STATE_ROOT}" \
+      --typed-root "${TYPED_ROOT}" \
       --channel-capacity "${CHANNEL_CAPACITY}" \
       --flush-interval-ms "${FLUSH_INTERVAL_MS}" \
       --flush-bytes "${FLUSH_BYTES}" \

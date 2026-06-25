@@ -419,6 +419,8 @@ pub struct RecorderRunManifest {
     pub local_start_ts_ns: i64,
     pub raw_root: PathBuf,
     pub state_root: PathBuf,
+    #[serde(default)]
+    pub typed_root: Option<PathBuf>,
     pub audit_profile_hash: Option<String>,
     pub config_hash: Option<String>,
     #[serde(default)]

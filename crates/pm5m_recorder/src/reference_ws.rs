@@ -1034,6 +1034,7 @@ fn write_reference_run_manifest(options: &ReferenceWsRecorderOptions) -> Result<
         local_start_ts_ns: now_unix_ns() as i64,
         raw_root: options.raw_root.clone(),
         state_root: options.state_root.clone(),
+        typed_root: None,
         audit_profile_hash: options.audit_profile_hash.clone(),
         config_hash: Some(sha256_bytes(&serde_json::to_vec(&json!({
             "venues": options.venues,

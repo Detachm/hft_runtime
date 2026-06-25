@@ -95,6 +95,8 @@ enum Command {
         #[arg(long)]
         state_root: PathBuf,
         #[arg(long)]
+        typed_root: Option<PathBuf>,
+        #[arg(long)]
         book_state_cache_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "hftrec4")]
         raw_format: RawFormatArg,
@@ -154,6 +156,8 @@ enum Command {
         raw_root: PathBuf,
         #[arg(long)]
         state_root: PathBuf,
+        #[arg(long)]
+        typed_root: Option<PathBuf>,
         #[arg(long)]
         book_state_cache_root: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "hftrec4")]
@@ -248,6 +252,7 @@ fn main() -> Result<()> {
             config,
             raw_root,
             state_root,
+            typed_root,
             book_state_cache_root,
             raw_format,
             endpoint,
@@ -275,6 +280,7 @@ fn main() -> Result<()> {
                 endpoint,
                 raw_root,
                 state_root,
+                typed_root,
                 book_state_cache_root,
                 audit_profile_hash: None,
                 raw_format: raw_format.into(),
@@ -348,6 +354,7 @@ fn main() -> Result<()> {
             config,
             raw_root,
             state_root,
+            typed_root,
             book_state_cache_root,
             raw_format,
             endpoint,
@@ -399,6 +406,7 @@ fn main() -> Result<()> {
                 endpoint,
                 raw_root: raw_root.clone(),
                 state_root: state_root.clone(),
+                typed_root,
                 book_state_cache_root,
                 audit_profile_hash: audit_profile_hash.clone(),
                 raw_format: raw_format.into(),

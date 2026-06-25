@@ -1,14 +1,18 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use pm5m_market_cache::{
-    bench_book_cache2, bench_book_state_index, build_book_cache, build_book_state_index,
-    build_reference_cache, build_reference_cache_from_binance, build_settlement_cache,
-    build_settlement_cache_from_clob, build_settlement_cache_from_condition_metadata,
-    inspect_book_cache2_coverage, validate_book_cache2, validate_book_state_index,
+    bench_book_cache2, bench_book_state_index, bench_market_replay_dataset, build_book_cache,
+    build_book_state_index, build_market_replay_compact_typed, build_market_replay_dataset,
+    build_market_replay_typed_updates, build_reference_cache, build_reference_cache_from_binance,
+    build_settlement_cache, build_settlement_cache_from_clob,
+    build_settlement_cache_from_condition_metadata, inspect_book_cache2_coverage,
+    validate_book_cache2, validate_book_state_index, validate_market_replay_compact_typed,
     validate_reference_cache, validate_settlement_cache, BuildBookCacheOptions,
-    BuildBookStateIndexOptions, BuildReferenceCacheFromBinanceOptions, BuildReferenceCacheOptions,
+    BuildBookStateIndexOptions, BuildMarketReplayCompactTypedOptions,
+    BuildMarketReplayDatasetOptions, BuildMarketReplayTypedUpdatesOptions,
+    BuildReferenceCacheFromBinanceOptions, BuildReferenceCacheOptions,
     BuildSettlementCacheFromClobOptions, BuildSettlementCacheFromConditionMetadataOptions,
-    BuildSettlementCacheOptions,
+    BuildSettlementCacheOptions, ValidateMarketReplayCompactTypedOptions,
 };
 use std::path::PathBuf;
 
@@ -49,6 +53,102 @@ enum Command {
         poly_incremental_freshness_guard_ms: i64,
         #[arg(long)]
         overwrite: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    BuildMarketReplayDataset {
+        #[arg(long = "raw-root", required = true)]
+        raw_roots: Vec<PathBuf>,
+        #[arg(long)]
+        dataset_root: PathBuf,
+        #[arg(long)]
+        raw_start_ts_ns: Option<i64>,
+        #[arg(long)]
+        raw_end_ts_ns: Option<i64>,
+        #[arg(long = "market-symbol")]
+        market_symbols: Vec<String>,
+        #[arg(long)]
+        poly_server_visible_time: bool,
+        #[arg(long, default_value_t = 20)]
+        poly_incremental_latency_ms: i64,
+        #[arg(long, default_value_t = 500)]
+        poly_incremental_freshness_guard_ms: i64,
+        #[arg(long, default_value_t = 200)]
+        reference_latency_ms: i64,
+        #[arg(long)]
+        max_rows_per_part: Option<usize>,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    BuildMarketReplayTypedUpdates {
+        #[arg(long = "raw-root", required = true)]
+        raw_roots: Vec<PathBuf>,
+        #[arg(long)]
+        output_file: Option<PathBuf>,
+        #[arg(long)]
+        output_root: Option<PathBuf>,
+        #[arg(long)]
+        raw_start_ts_ns: Option<i64>,
+        #[arg(long)]
+        raw_end_ts_ns: Option<i64>,
+        #[arg(long = "market-symbol")]
+        market_symbols: Vec<String>,
+        #[arg(long)]
+        poly_server_visible_time: bool,
+        #[arg(long, default_value_t = 20)]
+        poly_incremental_latency_ms: i64,
+        #[arg(long, default_value_t = 500)]
+        poly_incremental_freshness_guard_ms: i64,
+        #[arg(long, default_value_t = 200)]
+        reference_latency_ms: i64,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    BuildMarketReplayCompactTyped {
+        #[arg(long = "raw-root", required = true)]
+        raw_roots: Vec<PathBuf>,
+        #[arg(long)]
+        output_root: PathBuf,
+        #[arg(long)]
+        raw_start_ts_ns: Option<i64>,
+        #[arg(long)]
+        raw_end_ts_ns: Option<i64>,
+        #[arg(long)]
+        overwrite: bool,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    ValidateMarketReplayCompactTyped {
+        #[arg(long = "raw-root", required = true)]
+        raw_roots: Vec<PathBuf>,
+        #[arg(long = "compact-typed-root", required = true)]
+        compact_typed_roots: Vec<PathBuf>,
+        #[arg(long)]
+        raw_start_ts_ns: Option<i64>,
+        #[arg(long)]
+        raw_end_ts_ns: Option<i64>,
+        #[arg(long = "market-symbol")]
+        market_symbols: Vec<String>,
+        #[arg(long)]
+        poly_server_visible_time: bool,
+        #[arg(long, default_value_t = 20)]
+        poly_incremental_latency_ms: i64,
+        #[arg(long, default_value_t = 500)]
+        poly_incremental_freshness_guard_ms: i64,
+        #[arg(long, default_value_t = 200)]
+        reference_latency_ms: i64,
+        #[arg(long, default_value_t = 1)]
+        raw_worker_count: usize,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    BenchMarketReplayDataset {
+        #[arg(long)]
+        dataset_root: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -222,6 +322,118 @@ fn main() -> Result<()> {
                 poly_incremental_latency_ms,
                 poly_incremental_freshness_guard_ms,
             })?;
+            print_or_write_json(output.as_deref(), &report)?;
+        }
+        Command::BuildMarketReplayDataset {
+            raw_roots,
+            dataset_root,
+            raw_start_ts_ns,
+            raw_end_ts_ns,
+            market_symbols,
+            poly_server_visible_time,
+            poly_incremental_latency_ms,
+            poly_incremental_freshness_guard_ms,
+            reference_latency_ms,
+            max_rows_per_part,
+            overwrite,
+            output,
+        } => {
+            let report = build_market_replay_dataset(&BuildMarketReplayDatasetOptions {
+                raw_roots,
+                dataset_root,
+                raw_start_ts_ns,
+                raw_end_ts_ns,
+                market_symbol_allowlist: market_symbols,
+                overwrite,
+                poly_server_visible_time,
+                poly_incremental_latency_ms,
+                poly_incremental_freshness_guard_ms,
+                reference_latency_ms,
+                max_rows_per_part,
+            })?;
+            print_or_write_json(output.as_deref(), &report)?;
+        }
+        Command::BuildMarketReplayTypedUpdates {
+            raw_roots,
+            output_file,
+            output_root,
+            raw_start_ts_ns,
+            raw_end_ts_ns,
+            market_symbols,
+            poly_server_visible_time,
+            poly_incremental_latency_ms,
+            poly_incremental_freshness_guard_ms,
+            reference_latency_ms,
+            overwrite,
+            output,
+        } => {
+            let report =
+                build_market_replay_typed_updates(&BuildMarketReplayTypedUpdatesOptions {
+                    raw_roots,
+                    output_file,
+                    output_root,
+                    raw_start_ts_ns,
+                    raw_end_ts_ns,
+                    market_symbol_allowlist: market_symbols,
+                    overwrite,
+                    poly_server_visible_time,
+                    poly_incremental_latency_ms,
+                    poly_incremental_freshness_guard_ms,
+                    reference_latency_ms,
+                })?;
+            print_or_write_json(output.as_deref(), &report)?;
+        }
+        Command::BuildMarketReplayCompactTyped {
+            raw_roots,
+            output_root,
+            raw_start_ts_ns,
+            raw_end_ts_ns,
+            overwrite,
+            output,
+        } => {
+            let report =
+                build_market_replay_compact_typed(&BuildMarketReplayCompactTypedOptions {
+                    raw_roots,
+                    output_root,
+                    raw_start_ts_ns,
+                    raw_end_ts_ns,
+                    overwrite,
+                })?;
+            print_or_write_json(output.as_deref(), &report)?;
+        }
+        Command::ValidateMarketReplayCompactTyped {
+            raw_roots,
+            compact_typed_roots,
+            raw_start_ts_ns,
+            raw_end_ts_ns,
+            market_symbols,
+            poly_server_visible_time,
+            poly_incremental_latency_ms,
+            poly_incremental_freshness_guard_ms,
+            reference_latency_ms,
+            raw_worker_count,
+            output,
+        } => {
+            let report =
+                validate_market_replay_compact_typed(&ValidateMarketReplayCompactTypedOptions {
+                    raw_roots,
+                    compact_typed_roots,
+                    raw_start_ts_ns,
+                    raw_end_ts_ns,
+                    market_symbol_allowlist: market_symbols,
+                    poly_server_visible_time,
+                    poly_incremental_latency_ms,
+                    poly_incremental_freshness_guard_ms,
+                    reference_latency_ms,
+                    raw_worker_count,
+                })?;
+            print_or_write_json(output.as_deref(), &report)?;
+        }
+        Command::BenchMarketReplayDataset {
+            dataset_root,
+            output,
+        } => {
+            let report = bench_market_replay_dataset(&dataset_root)?;
             print_or_write_json(output.as_deref(), &report)?;
         }
         Command::ValidateBookCache { cache_root, output } => {

@@ -5,6 +5,7 @@
 /.tmp_ws_raw_zstd22/
 /.work_poly_live/
 /tmp/
+/.codex_tmp/
 **/__pycache__/
 **/*.pyc
 **/*.rs.bk
