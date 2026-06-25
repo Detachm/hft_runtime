@@ -66,3 +66,45 @@ Target the largest controllable cost without moving work into a large preprocess
 2. Preserve exact hashes on the 3h golden window.
 3. Re-profile default and deep mode.
 4. If improvement is material, commit as a standalone iteration.
+
+## Iteration 1 Result, 2026-06-26
+
+Change: in the private market replay strategy comparator, skip constructing bid top10 levels for
+stream books when both replay configs have `enable_exit_sell=false`. Best bid is still computed, so
+crossed-book checks remain unchanged; ask levels are still built because buy sizing/execution needs
+them. If either config enables sell exits, the runner falls back to full bid+ask level construction.
+
+Status:
+
+- This code path currently lives under ignored `hft_private/`; the public repo records the iteration
+  result here, but the code change is not in the public commit unless the private boundary changes.
+- Correctness: 3h golden hashes matched all four expected hashes.
+- Private tests: `cargo test --manifest-path hft_private/Cargo.toml` passed.
+
+Default compact typed serial run:
+
+- baseline: 46.793s / 3h
+- iteration 1: 44.932s / 3h
+- improvement: 1.861s / 3h, 4.0%
+- linear 7d estimate: 41.9 min
+- linear 30d estimate: 3.00 h
+
+Deep profile:
+
+- elapsed: 52.649s / 3h
+- `stream_book_levels_ns`: 2.983s -> 1.619s
+- `book_row_build_ns`: 8.365s -> 6.697s
+- largest remaining buckets:
+  - callback total: 33.122s
+  - apply update / state maintenance: 21.018s
+  - on-book strategy event: 7.035s
+  - BookRow build: 6.697s
+  - typed stream merge/flush: 6.455s
+  - compact segment read: 5.614s
+  - replay state apply: 5.501s
+  - V1 on-book event: 5.177s
+  - compact record decode: 4.799s
+
+Next target: reduce `affected_assets`/`replay_state_apply`/BookRow construction by avoiding owned
+asset-id sets and repeated string-key lookups in the hot path, while preserving exact update order
+and hash output.
