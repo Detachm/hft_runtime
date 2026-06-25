@@ -424,6 +424,24 @@ Conclusion: avoiding the write-then-readback pattern is a real exact-path improv
 a constant-factor win, not the required order-of-magnitude jump. BTC remains the wall-clock limiter:
 after this change BTC deep-mode wall is 27.366s for 3h, while ETH/SOL finish much earlier.
 
+## Rejected Attempt: Stream Metadata Hot-Cache Fast Path, 2026-06-26
+
+Attempt: on `stream_meta_by_asset_id` cache hits, skip re-reading condition/symbol/window metadata
+from the replay book state and use the cached metadata directly. The cache hit count is much larger
+than misses, so this targeted `stream_book_metadata_ns`.
+
+Result:
+
+- previous symbol-parallel default: 23.954s / 3h
+- metadata fast-path symbol-parallel default: 24.185s / 3h
+- current replay orders changed from 107 to 109
+
+Reason: this is not just a defensive consistency check. For some updates, requiring the current
+book/update metadata before emitting the stream book affects whether the event is observable to the
+strategy. Skipping it changes replay semantics.
+
+Status: reverted, not committed.
+
 ## Rejected Attempt: Condition Update Dispatch, 2026-06-26
 
 Attempt: change condition-direct compact typed mode so the dispatcher sends typed updates to
