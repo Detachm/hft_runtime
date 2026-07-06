@@ -30,3 +30,5 @@ arrow = "53.4"
 parquet = { version = "53.4", features = ["arrow", "zstd"] }
 crc32fast = "1.4"
 zstd = "0.13"
+csv = "1.3"
+rayon = "1.10"
