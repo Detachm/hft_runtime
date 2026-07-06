@@ -10,7 +10,9 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 crc32fast.workspace = true
+csv.workspace = true
 market_data_etl_core = { path = "../market_data_etl_core", version = "0.1.0" }
+rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
